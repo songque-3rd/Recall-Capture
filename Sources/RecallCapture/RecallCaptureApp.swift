@@ -133,6 +133,9 @@ final class AppModel: ObservableObject {
 
     var isRecording: Bool { state == .recording }
     var canStart: Bool { state == .idle && !isStarting && !isStopping }
+    var usesAdHocSigning: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "RecallCaptureSigningMode") as? String == "ad-hoc"
+    }
 
     var elapsedDescription: String {
         guard let startedAt else { return "--:--:--" }
@@ -148,7 +151,7 @@ final class AppModel: ObservableObject {
     func refreshMeetWindows() {
         guard !isStarting, !isStopping else { return }
         guard requestScreenRecordingPermission() else {
-            message = "このRecall Captureから画面収録を利用できません。システム設定を確認し、権限を再確認してください。"
+            message = screenRecordingRecoveryMessage
             return
         }
         isStarting = true
@@ -172,6 +175,17 @@ final class AppModel: ObservableObject {
 
     func refreshPermissions() {
         permissionSnapshot = permissionService.snapshot()
+    }
+
+    func recheckPermissions() {
+        refreshPermissions()
+        if permissionSnapshot.screenRecording == .denied {
+            message = screenRecordingRecoveryMessage
+        } else if permissionSnapshot.microphone == .denied {
+            message = "マイクが未許可です。マイク設定でRecall Captureをオンにしてください。"
+        } else {
+            message = "マイクと画面収録の権限を確認できました。"
+        }
     }
 
     func openMicrophonePrivacySettings() {
@@ -255,7 +269,7 @@ final class AppModel: ObservableObject {
             defer { isStarting = false }
             guard prepareStorageForRecording() else { return }
             guard requestScreenRecordingPermission() else {
-                message = "このRecall Captureから画面収録を利用できません。設定画面で権限を再確認してください。"
+                message = screenRecordingRecoveryMessage
                 return
             }
             guard await requestMicrophonePermission() else {
@@ -398,7 +412,15 @@ final class AppModel: ObservableObject {
             message = "システム設定の\(name)権限を開けませんでした。"
             return
         }
-        message = "システム設定でRecall Captureの\(name)権限を確認し、戻ったら『権限を再確認』を押してください。"
+        if anchor == "Privacy_ScreenCapture" {
+            message = "画面収録設定の変更は再起動後に反映されます。Recall Captureを完全終了してから起動し直してください。"
+        } else {
+            message = "システム設定でRecall Captureの\(name)権限を確認し、戻ったら『権限を再確認』を押してください。"
+        }
+    }
+
+    private var screenRecordingRecoveryMessage: String {
+        "画面収録が設定でオンなら、Recall Captureを完全終了して起動し直してください。再起動後も未許可なら、設定を一度オフ→オンにしてもう一度再起動してください。"
     }
 
     private func transition(to newState: SessionState) throws {
@@ -709,7 +731,7 @@ private struct SettingsView: View {
             )
             HStack {
                 Button("権限を再確認") {
-                    model.refreshPermissions()
+                    model.recheckPermissions()
                 }
                 Button("マイク設定") {
                     model.openMicrophonePrivacySettings()
@@ -717,6 +739,14 @@ private struct SettingsView: View {
                 Button("画面収録設定") {
                     model.openScreenRecordingPrivacySettings()
                 }
+            }
+            if model.permissionSnapshot.screenRecording == .denied {
+                Text("画面収録設定の変更は、Recall Captureを完全終了して起動し直すまで反映されません。再起動後も未許可なら、設定を一度オフ→オンにしてもう一度再起動してください。")
+                    .foregroundStyle(.orange)
+            }
+            if model.usesAdHocSigning {
+                Text("このアプリは開発用の一時署名です。再ビルド後は画面収録を再許可する必要があります。継続利用には同じApple Development証明書でビルドしてください。")
+                    .foregroundStyle(.secondary)
             }
             Text("外部AI: 使用しない（既定）")
             Text("音声は60秒チャンクで一時保存し、3時間で自動停止します。")

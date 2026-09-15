@@ -92,6 +92,11 @@ env CLANG_MODULE_CACHE_PATH="${module_cache}" xcrun swiftc \
 "${icon_generator}" "${staged_app_dir}/Contents/Resources/RecallCapture.icns"
 
 cp "${project_dir}/Resources/RecallCapture-Info.plist" "${staged_app_dir}/Contents/Info.plist"
+if [[ "${signing_identity}" == "-" ]]; then
+    plutil -insert RecallCaptureSigningMode -string "ad-hoc" "${staged_app_dir}/Contents/Info.plist"
+else
+    plutil -insert RecallCaptureSigningMode -string "certificate" "${staged_app_dir}/Contents/Info.plist"
+fi
 plutil -lint "${staged_app_dir}/Contents/Info.plist"
 codesign --force --deep --sign "${signing_identity}" "${staged_app_dir}"
 codesign --verify --deep --strict "${staged_app_dir}"
