@@ -37,32 +37,56 @@ enum SmokeCheck {
             timezone: timezone,
             appVersion: "0.1.0"
         )
-        let utterance = UtteranceRecord(
-            index: 1,
-            startMilliseconds: 1_000,
-            endMilliseconds: 2_500,
-            speaker: "speaker_01",
-            track: .microphone,
-            language: "ja",
-            text: "テストです。",
-            confidence: nil
-        )
+        let utterances = [
+            UtteranceRecord(
+                index: 1,
+                startMilliseconds: 1_000,
+                endMilliseconds: 2_500,
+                speaker: "speaker_01",
+                track: .microphone,
+                language: "ja",
+                text: "今日の重要なポイントはデータの分類です。",
+                confidence: 0.91
+            ),
+            UtteranceRecord(
+                index: 2,
+                startMilliseconds: 4_000,
+                endMilliseconds: 6_500,
+                speaker: "speaker_01",
+                track: .microphone,
+                language: "ja",
+                text: "次回までの課題として具体例を確認してください。",
+                confidence: 0.87
+            )
+        ]
 
         try pathPolicy.createDirectory(for: location)
         try TranscriptJSONLWriter().write(
             metadata: metadata,
-            utterances: [utterance],
+            utterances: utterances,
             to: location.transcriptJSONL
         )
 
         let writtenData = try Data(contentsOf: location.transcriptJSONL)
         let lines = writtenData.split(separator: 0x0A)
-        guard lines.count == 2,
+        guard lines.count == 3,
               let record = try JSONSerialization.jsonObject(with: Data(lines[1])) as? [String: Any],
               record["type"] as? String == "utterance",
-              record["confidence"] is NSNull else {
+              record["confidence"] as? Double == 0.91 else {
             throw SmokeCheckError.invalidJSONL
         }
+
+        let summary = LocalSummaryBuilder().build(metadata: metadata, utterances: utterances)
+        guard summary.sections.map(\.title) == ["講義の主要内容", "復習ポイント"],
+              summary.sections[1].items.contains(where: { $0.contains("課題") }) else {
+            throw SmokeCheckError.invalidSummary
+        }
+        try SummaryPDFWriter().write(
+            summary: summary,
+            metadata: metadata,
+            to: location.summaryPDF
+        )
+        try SummaryPDFWriter().validate(location.summaryPDF)
 
         var stateMachine = SessionStateMachine()
         try stateMachine.transition(to: .recording)
@@ -156,6 +180,7 @@ enum SmokeCheck {
 
         print("smoke-check: passed")
         print(location.transcriptJSONL.path)
+        print(location.summaryPDF.path)
     }
 }
 
@@ -164,6 +189,7 @@ enum SmokeCheckError: Error {
     case invalidFixture
     case unexpectedSessionPath(String)
     case invalidJSONL
+    case invalidSummary
     case invalidTransitionAccepted
     case invalidRecordingManifest
     case invalidBrowserWindowFiltering

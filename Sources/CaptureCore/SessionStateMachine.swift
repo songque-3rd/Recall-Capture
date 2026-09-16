@@ -33,7 +33,7 @@ public struct SessionStateMachine: Sendable {
     }
 
     private static let allowedTransitions: [SessionState: Set<SessionState>] = [
-        .idle: [.recording],
+        .idle: [.recording, .detectingSpeech],
         .recording: [.finalizingAudio, .failed],
         .finalizingAudio: [.detectingSpeech, .failed],
         .detectingSpeech: [.transcribing, .failed],

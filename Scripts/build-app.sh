@@ -110,9 +110,9 @@ ditto -c -k --keepParent "${staged_app_dir}" "${staged_archive}"
 # its portable archive back. RecallCapture.zip is the distributable artifact.
 rm -rf "${app_dir}"
 ditto --noextattr --norsrc "${staged_app_dir}" "${app_dir}"
-# File Provider may add an empty FinderInfo attribute to the copied bundle.
-# It is not application data, but codesign treats it as disallowed metadata.
-/usr/bin/xattr -d com.apple.FinderInfo "${app_dir}" 2>/dev/null || true
+# File Provider may add Finder metadata to the copied bundle. It is not
+# application data, but codesign treats any such metadata as disallowed.
+/usr/bin/xattr -cr "${app_dir}"
 codesign --verify --deep --strict "${app_dir}"
 cp "${staged_archive}" "${archive_path}"
 

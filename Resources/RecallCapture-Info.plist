@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.2</string>
+    <string>0.3.0</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
 	<key>LSUIElement</key>
@@ -30,6 +30,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>会議や授業を文字起こしするため、選択したマイクの音声を録音します。</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>録音した会議や授業を端末内で文字起こしするために音声認識を使用します。</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

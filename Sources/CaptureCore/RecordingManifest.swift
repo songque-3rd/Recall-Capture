@@ -4,6 +4,8 @@ public enum RecordingStatus: String, Codable, Sendable {
     case recording
     case finalizing
     case readyForProcessing = "ready_for_processing"
+    case processing
+    case completed
     case failed
 }
 

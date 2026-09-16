@@ -10,6 +10,9 @@ struct RecallCaptureApp: App {
     var body: some Scene {
         Window("Recall Capture", id: "main") {
             MainWindowView(model: model)
+                .task {
+                    model.handleLaunchArgumentsIfNeeded()
+                }
         }
         .defaultSize(width: 600, height: 560)
 
@@ -97,6 +100,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var message = "録音を開始できます。"
     @Published private(set) var isStarting = false
     @Published private(set) var isStopping = false
+    @Published private(set) var isProcessing = false
     @Published private var now = Date()
     @Published var languageMode = LanguageMode.japanese
 
@@ -107,12 +111,14 @@ final class AppModel: ObservableObject {
     private var activeWorkspace: RecordingWorkspacePaths?
     private var clockTask: Task<Void, Never>?
     private var automaticStopTask: Task<Void, Never>?
+    private var didHandleLaunchArguments = false
 
     private lazy var coordinator = RecordingCoordinator(workspaceRoot: saveDirectoryURL) { [weak self] errorMessage in
         Task { @MainActor [weak self] in
             await self?.handleCaptureFailure(errorMessage)
         }
     }
+    private let postProcessor = PostProcessingCoordinator()
 
     init() {
         let destinationStore = RecordingDestinationStore()
@@ -132,7 +138,7 @@ final class AppModel: ObservableObject {
     }
 
     var isRecording: Bool { state == .recording }
-    var canStart: Bool { state == .idle && !isStarting && !isStopping }
+    var canStart: Bool { state == .idle && !isStarting && !isStopping && !isProcessing }
     var usesAdHocSigning: Bool {
         Bundle.main.object(forInfoDictionaryKey: "RecallCaptureSigningMode") as? String == "ad-hoc"
     }
@@ -149,7 +155,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshMeetWindows() {
-        guard !isStarting, !isStopping else { return }
+        guard !isStarting, !isStopping, !isProcessing else { return }
         guard requestScreenRecordingPermission() else {
             message = screenRecordingRecoveryMessage
             return
@@ -196,10 +202,22 @@ final class AppModel: ObservableObject {
         openPrivacySettings(anchor: "Privacy_ScreenCapture", name: "画面収録")
     }
 
+    func openSpeechRecognitionPrivacySettings() {
+        openPrivacySettings(anchor: "Privacy_SpeechRecognition", name: "音声認識")
+    }
+
+    func openDictationSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension"
+        ), NSWorkspace.shared.open(url) else {
+            message = "システム設定のキーボード設定を開けませんでした。"
+            return
+        }
+        message = "キーボード設定の『音声入力』をオンにしてから、後処理を再開してください。"
+    }
+
     func refreshRecoveryCandidates() {
-        recoveryCount = RecordingCoordinator.recoveryCandidates(workspaceRoot: saveDirectoryURL).filter {
-            $0.manifest.status != .readyForProcessing
-        }.count
+        recoveryCount = actionableRecoveryCandidates().count
     }
 
     func chooseSaveDirectory() {
@@ -319,7 +337,7 @@ final class AppModel: ObservableObject {
     }
 
     func stopRecording(automatic: Bool = false) {
-        guard activeWorkspace != nil, !isStopping else { return }
+        guard activeWorkspace != nil, !isStopping, !isProcessing else { return }
         isStopping = true
         cancelTimers()
         if state == .recording {
@@ -330,15 +348,18 @@ final class AppModel: ObservableObject {
             : "録音を停止し、音声を確定しています…"
 
         Task {
-            defer { isStopping = false }
             do {
                 let result = try await coordinator.stop()
                 setLastWorkspace(result.workspace.directory)
-                resetToIdle()
+                activeWorkspace = nil
+                startedAt = nil
+                isStopping = false
                 message = automatic
-                    ? "3時間で自動停止しました。音声チャンクを安全に保存しました。"
-                    : "録音を停止し、音声チャンクを安全に保存しました。"
+                    ? "3時間で自動停止しました。文字起こしを開始します…"
+                    : "録音を停止しました。文字起こしを開始します…"
+                await process(workspace: result.workspace, manifest: result.manifest)
             } catch {
+                isStopping = false
                 setLastWorkspace(activeWorkspace?.directory)
                 state = .failed
                 message = "録音音声を保持しましたが、確定処理で問題が発生しました: \(error.localizedDescription)"
@@ -347,6 +368,91 @@ final class AppModel: ObservableObject {
                 stateMachine = SessionStateMachine()
             }
             refreshRecoveryCandidates()
+        }
+    }
+
+    func resumePostProcessing() {
+        guard canStart, let candidate = actionableRecoveryCandidates().last else { return }
+        setLastWorkspace(candidate.paths.directory)
+        message = "保存済み音声から後処理を再開します…"
+        Task {
+            await process(workspace: candidate.paths, manifest: candidate.manifest)
+            refreshRecoveryCandidates()
+        }
+    }
+
+    func handleLaunchArgumentsIfNeeded() {
+        guard !didHandleLaunchArguments else { return }
+        didHandleLaunchArguments = true
+        if CommandLine.arguments.contains("--resume-latest-recording") {
+            resumePostProcessing()
+        }
+    }
+
+    private func process(
+        workspace: RecordingWorkspacePaths,
+        manifest: RecordingManifest
+    ) async {
+        isProcessing = true
+        defer { isProcessing = false }
+        if state == .idle || state == .failed || state == .completed {
+            stateMachine = SessionStateMachine()
+            state = .idle
+        }
+
+        do {
+            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+                ?? "development"
+            let result = try await postProcessor.process(
+                workspace: workspace,
+                manifest: manifest,
+                appVersion: version
+            ) { [weak self] nextState in
+                await self?.showProcessingState(nextState)
+            }
+            try transition(to: .completed)
+            setLastWorkspace(result.workspace.directory)
+            resetToIdle()
+            message = "文字起こし（\(result.utteranceCount)件）と要約PDFを作成しました。"
+        } catch {
+            if state != .failed {
+                try? transition(to: .failed)
+            }
+            stateMachine = SessionStateMachine()
+            state = .idle
+            message = "後処理を完了できませんでした: \(error.localizedDescription)"
+        }
+    }
+
+    private func showProcessingState(_ nextState: SessionState) {
+        do {
+            try transition(to: nextState)
+            message = switch nextState {
+            case .detectingSpeech: "発話を検出しています…"
+            case .transcribing: "端末内で文字起こししています…"
+            case .diarizing: "音声トラックから話者を整理しています…"
+            case .formatting: "文字起こしを整形しています…"
+            case .summarizingChunks: "発話の要点を抽出しています…"
+            case .summarizingOverall: "全体要約を組み立てています…"
+            case .writingArtifacts: "文字起こしJSONLと要約PDFを書き出しています…"
+            case .validatingArtifacts: "作成した成果物を検証しています…"
+            default: message
+            }
+        } catch {
+            message = "後処理の状態更新に失敗しました: \(error.localizedDescription)"
+        }
+    }
+
+    private func actionableRecoveryCandidates() -> [RecordingRecoveryCandidate] {
+        RecordingCoordinator.recoveryCandidates(workspaceRoot: saveDirectoryURL).filter { candidate in
+            guard !candidate.manifest.chunks.isEmpty,
+                  [.readyForProcessing, .processing, .failed].contains(candidate.manifest.status) else {
+                return false
+            }
+            let location = SessionLocation(directory: candidate.paths.directory)
+            let hasTranscript = FileManager.default.fileExists(atPath: location.transcriptJSONL.path)
+            let hasPDF = FileManager.default.fileExists(atPath: location.summaryPDF.path)
+            return !(hasTranscript && hasPDF)
         }
     }
 
@@ -490,12 +596,12 @@ private struct CaptureMenu: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if model.isRecording || model.isStopping {
-            Text("録音中  \(model.elapsedDescription)")
-            Button(model.isStopping ? "停止処理中…" : "録音停止") {
+        if model.isRecording || model.isStopping || model.isProcessing {
+            Text(model.isProcessing ? "後処理中" : "録音中  \(model.elapsedDescription)")
+            Button(model.isProcessing ? "後処理中…" : (model.isStopping ? "停止処理中…" : "録音停止")) {
                 model.stopRecording()
             }
-            .disabled(model.isStopping)
+            .disabled(model.isStopping || model.isProcessing)
         } else {
             Menu("オンライン会議を録音") {
                 ForEach(model.meetWindows) { window in
@@ -531,6 +637,10 @@ private struct CaptureMenu: View {
 
         if model.recoveryCount > 0 {
             Text("復旧候補: \(model.recoveryCount)件")
+            Button("後処理を再開") {
+                model.resumePostProcessing()
+            }
+            .disabled(!model.canStart)
         }
         if !model.message.isEmpty {
             Text(model.message)
@@ -614,13 +724,13 @@ private struct MainWindowView: View {
             Text("録音操作")
                 .font(.headline)
 
-            if model.isRecording || model.isStopping {
-                Button(model.isStopping ? "停止処理中…" : "録音停止") {
+            if model.isRecording || model.isStopping || model.isProcessing {
+                Button(model.isProcessing ? "後処理中…" : (model.isStopping ? "停止処理中…" : "録音停止")) {
                     model.stopRecording()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-                .disabled(model.isStopping)
+                .disabled(model.isStopping || model.isProcessing)
             } else {
                 HStack(spacing: 12) {
                     Menu("オンライン会議を録音") {
@@ -653,6 +763,13 @@ private struct MainWindowView: View {
                         }
                     }
                     .accessibilityLabel("対面授業を録音")
+                }
+                .disabled(!model.canStart)
+            }
+
+            if model.recoveryCount > 0 {
+                Button("保存済み音声の後処理を再開") {
+                    model.resumePostProcessing()
                 }
                 .disabled(!model.canStart)
             }
@@ -739,7 +856,15 @@ private struct SettingsView: View {
                 Button("画面収録設定") {
                     model.openScreenRecordingPrivacySettings()
                 }
+                Button("音声認識設定") {
+                    model.openSpeechRecognitionPrivacySettings()
+                }
+                Button("音声入力設定") {
+                    model.openDictationSettings()
+                }
             }
+            Text("文字起こしには、音声認識権限に加えて、キーボード設定の『音声入力』をオンにする必要があります。")
+                .foregroundStyle(.secondary)
             if model.permissionSnapshot.screenRecording == .denied {
                 Text("画面収録設定の変更は、Recall Captureを完全終了して起動し直すまで反映されません。再起動後も未許可なら、設定を一度オフ→オンにしてもう一度再起動してください。")
                     .foregroundStyle(.orange)
