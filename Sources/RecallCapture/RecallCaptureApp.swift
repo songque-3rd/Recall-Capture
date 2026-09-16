@@ -863,8 +863,13 @@ private struct SettingsView: View {
                     model.openDictationSettings()
                 }
             }
-            Text("文字起こしには、音声認識権限に加えて、キーボード設定の『音声入力』をオンにする必要があります。")
-                .foregroundStyle(.secondary)
+            if #available(macOS 26.0, *) {
+                Text("長時間会話向けの高精度オンデバイス認識を使用します。初回のみAppleの言語モデル取得が必要な場合があります。モデルを利用できない場合は従来方式へ切り替えるため、『音声入力』もオンにしてください。")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("文字起こしには、音声認識権限に加えて、キーボード設定の『音声入力』をオンにする必要があります。")
+                    .foregroundStyle(.secondary)
+            }
             if model.permissionSnapshot.screenRecording == .denied {
                 Text("画面収録設定の変更は、Recall Captureを完全終了して起動し直すまで反映されません。再起動後も未許可なら、設定を一度オフ→オンにしてもう一度再起動してください。")
                     .foregroundStyle(.orange)

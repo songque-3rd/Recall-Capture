@@ -66,6 +66,19 @@ env CLANG_MODULE_CACHE_PATH="${verification_dir}/audio-module-cache" xcrun swift
     "${module_dir}/CaptureCore.o" \
     -o "${verification_dir}/audio-chunk-smoke"
 
+# Compile the real speech-recognition path without executing it here. Runtime
+# execution is intentionally left to the signed app because macOS grants Speech
+# Recognition permission per app identity.
+env CLANG_MODULE_CACHE_PATH="${verification_dir}/speech-module-cache" xcrun swiftc \
+    -parse-as-library \
+    -module-cache-path "${verification_dir}/speech-module-cache" \
+    -sdk "${sdk_path}" \
+    "${compiler_interface_args[@]}" \
+    -target arm64-apple-macos15.0 \
+    "${project_dir}/Sources/RecallCapture/SpeechRecognitionEngine.swift" \
+    "${project_dir}/Verification/SpeechRecognitionSmokeCheck.swift" \
+    -o "${verification_dir}/speech-recognition-smoke"
+
 mkdir -p "${temporary_root}/core" "${temporary_root}/audio" "${temporary_root}/archive"
 "${verification_dir}/core-smoke" "${temporary_root}/core"
 "${verification_dir}/audio-chunk-smoke" "${temporary_root}/audio"

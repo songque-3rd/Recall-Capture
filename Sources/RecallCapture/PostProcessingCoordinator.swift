@@ -1,4 +1,3 @@
-@preconcurrency import Speech
 import CaptureCore
 import Foundation
 import NaturalLanguage
@@ -7,13 +6,6 @@ enum PostProcessingError: LocalizedError {
     case invalidManifest
     case noAudioChunks
     case missingAudio(String)
-    case speechPermissionDenied
-    case speechPermissionRestricted
-    case speechPermissionUnavailable
-    case dictationDisabled
-    case recognizerUnavailable(String)
-    case onDeviceRecognitionUnavailable(String)
-    case recognitionFailed(String)
     case noSpeechDetected
     case incompleteArtifacts
 
@@ -25,20 +17,6 @@ enum PostProcessingError: LocalizedError {
             "処理できる音声チャンクがありません。"
         case let .missingAudio(path):
             "音声チャンクが見つかりません: \(path)"
-        case .speechPermissionDenied:
-            "音声認識が未許可です。システム設定の『音声認識』でRecall Captureをオンにしてから再開してください。"
-        case .speechPermissionRestricted:
-            "このMacでは音声認識の使用が制限されています。"
-        case .speechPermissionUnavailable:
-            "音声認識の許可状態を確認できませんでした。"
-        case .dictationDisabled:
-            "macOSの音声入力がオフです。システム設定 > キーボード > 音声入力をオンにしてから、後処理を再開してください。"
-        case let .recognizerUnavailable(locale):
-            "\(locale) の音声認識を現在利用できません。"
-        case let .onDeviceRecognitionUnavailable(locale):
-            "\(locale) の端末内音声認識がこのMacで利用できません。"
-        case let .recognitionFailed(message):
-            "音声認識に失敗しました: \(message)"
         case .noSpeechDetected:
             "音声から発話を検出できませんでした。音声ファイルは再処理用に残しています。"
         case .incompleteArtifacts:
@@ -62,6 +40,7 @@ final class PostProcessingCoordinator: @unchecked Sendable {
     private let transcriptWriter = TranscriptJSONLWriter()
     private let summaryBuilder = LocalSummaryBuilder()
     private let pdfWriter = SummaryPDFWriter()
+    private let recognitionEngine = SpeechRecognitionEngine()
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -86,14 +65,14 @@ final class PostProcessingCoordinator: @unchecked Sendable {
             try manifestStore.save(manifest, to: workspace.manifestURL)
 
             await progress(.detectingSpeech)
-            try await authorizeSpeechRecognition()
-            let locales = try recognizers(for: manifest.languageMode)
+            try await recognitionEngine.authorize()
+            let locales = recognitionLocales(for: manifest.languageMode)
 
             await progress(.transcribing)
             let recognized = try await transcribe(
                 manifest: manifest,
                 workspace: workspace,
-                recognizers: locales
+                locales: locales
             )
             guard !recognized.isEmpty else {
                 throw PostProcessingError.noSpeechDetected
@@ -154,46 +133,18 @@ final class PostProcessingCoordinator: @unchecked Sendable {
         }
     }
 
-    private func authorizeSpeechRecognition() async throws {
-        let status = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
-        }
-        switch status {
-        case .authorized:
-            return
-        case .denied:
-            throw PostProcessingError.speechPermissionDenied
-        case .restricted:
-            throw PostProcessingError.speechPermissionRestricted
-        case .notDetermined:
-            throw PostProcessingError.speechPermissionUnavailable
-        @unknown default:
-            throw PostProcessingError.speechPermissionUnavailable
-        }
-    }
-
-    private func recognizers(for languageMode: LanguageMode) throws -> [SFSpeechRecognizer] {
+    private func recognitionLocales(for languageMode: LanguageMode) -> [Locale] {
         let identifiers = languageMode == .japanese ? ["ja-JP"] : ["ja-JP", "en-US"]
-        return try identifiers.map { identifier in
-            guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: identifier)),
-                  recognizer.isAvailable else {
-                throw PostProcessingError.recognizerUnavailable(identifier)
-            }
-            guard recognizer.supportsOnDeviceRecognition else {
-                throw PostProcessingError.onDeviceRecognitionUnavailable(identifier)
-            }
-            return recognizer
-        }
+        return identifiers.map(Locale.init(identifier:))
     }
 
     private func transcribe(
         manifest: RecordingManifest,
         workspace: RecordingWorkspacePaths,
-        recognizers: [SFSpeechRecognizer]
+        locales: [Locale]
     ) async throws -> [RecognizedSpan] {
         var result: [RecognizedSpan] = []
+        var recentContextByTrack: [String: [String]] = [:]
         let chunks = manifest.chunks.sorted {
             if $0.startedAtMilliseconds == $1.startedAtMilliseconds {
                 return $0.track.rawValue < $1.track.rawValue
@@ -207,16 +158,34 @@ final class PostProcessingCoordinator: @unchecked Sendable {
                 throw PostProcessingError.missingAudio(chunk.relativePath)
             }
 
-            var candidates: [[RecognizedSegment]] = []
-            for recognizer in recognizers {
-                let segments = try await recognize(url: url, with: recognizer)
-                candidates.append(segments)
+            let trackKey = chunk.track.rawValue
+            let contextualStrings = [manifest.title] + (recentContextByTrack[trackKey] ?? [])
+            var candidates: [RecognitionCandidate] = []
+            var firstFailure: Error?
+            for locale in locales {
+                do {
+                    let segments = try await recognitionEngine.recognize(
+                        url: url,
+                        locale: locale,
+                        contextualStrings: contextualStrings
+                    )
+                    candidates.append(RecognitionCandidate(locale: locale, segments: segments))
+                } catch {
+                    firstFailure = firstFailure ?? error
+                }
             }
             guard let best = candidates.max(by: { recognitionScore($0) < recognitionScore($1) }) else {
+                if let firstFailure { throw firstFailure }
                 continue
             }
+            let contextText = best.segments.map(\.text).joined(separator: " ")
+            if !contextText.isEmpty {
+                var context = recentContextByTrack[trackKey] ?? []
+                context.append(String(contextText.suffix(600)))
+                recentContextByTrack[trackKey] = Array(context.suffix(3))
+            }
             result.append(contentsOf: group(
-                best,
+                best.segments,
                 chunkOffsetMilliseconds: chunk.startedAtMilliseconds,
                 track: chunk.track
             ))
@@ -229,47 +198,18 @@ final class PostProcessingCoordinator: @unchecked Sendable {
         }
     }
 
-    private func recognize(
-        url: URL,
-        with recognizer: SFSpeechRecognizer
-    ) async throws -> [RecognizedSegment] {
-        try await withCheckedThrowingContinuation { continuation in
-            let request = SFSpeechURLRecognitionRequest(url: url)
-            request.requiresOnDeviceRecognition = true
-            request.shouldReportPartialResults = false
-            request.addsPunctuation = true
-            let gate = RecognitionGate(continuation: continuation)
-            gate.task = recognizer.recognitionTask(with: request) { result, error in
-                if let result, result.isFinal {
-                    gate.finish(.success(result.bestTranscription.segments.map {
-                        RecognizedSegment(
-                            text: $0.substring,
-                            startSeconds: $0.timestamp,
-                            durationSeconds: $0.duration,
-                            confidence: Double($0.confidence)
-                        )
-                    }))
-                } else if let error {
-                    let recognitionError = error as NSError
-                    let normalizedMessage = recognitionError.localizedDescription.lowercased()
-                    if recognitionError.code == 1_110 {
-                        gate.finish(.success([]))
-                    } else if normalizedMessage.contains("dictation")
-                        && normalizedMessage.contains("disabled") {
-                        gate.finish(.failure(PostProcessingError.dictationDisabled))
-                    } else {
-                        gate.finish(.failure(PostProcessingError.recognitionFailed(error.localizedDescription)))
-                    }
-                }
-            }
-        }
-    }
-
-    private func recognitionScore(_ segments: [RecognizedSegment]) -> Double {
-        guard !segments.isEmpty else { return 0 }
-        let confidence = segments.map(\.confidence).reduce(0, +) / Double(segments.count)
-        let characters = segments.reduce(0) { $0 + $1.text.count }
-        return confidence * 100 + Double(characters)
+    private func recognitionScore(_ candidate: RecognitionCandidate) -> Double {
+        guard !candidate.segments.isEmpty else { return -.infinity }
+        let confidence = candidate.segments.map(\.confidence).reduce(0, +)
+            / Double(candidate.segments.count)
+        let text = candidate.segments.map(\.text).joined(separator: " ")
+        let boundedLengthBonus = Double(min(text.count, 100)) * 0.08
+        let detectedLanguage = Self.language(of: text)
+        let expectedLanguage = candidate.locale.identifier.hasPrefix("ja") ? "ja" : "en"
+        let languageBonus = detectedLanguage == "und"
+            ? 0
+            : (detectedLanguage == expectedLanguage ? 20.0 : -20.0)
+        return confidence * 100 + boundedLengthBonus + languageBonus
     }
 
     private func group(
@@ -438,11 +378,9 @@ final class PostProcessingCoordinator: @unchecked Sendable {
     }
 }
 
-private struct RecognizedSegment: Sendable {
-    let text: String
-    let startSeconds: TimeInterval
-    let durationSeconds: TimeInterval
-    let confidence: Double
+private struct RecognitionCandidate: Sendable {
+    let locale: Locale
+    let segments: [RecognizedSegment]
 }
 
 private struct RecognizedSpan: Sendable {
@@ -452,30 +390,4 @@ private struct RecognizedSpan: Sendable {
     let language: String
     let text: String
     let confidence: Double
-}
-
-private final class RecognitionGate: @unchecked Sendable {
-    var task: SFSpeechRecognitionTask?
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<[RecognizedSegment], Error>?
-
-    init(continuation: CheckedContinuation<[RecognizedSegment], Error>) {
-        self.continuation = continuation
-    }
-
-    func finish(_ result: Result<[RecognizedSegment], Error>) {
-        lock.lock()
-        guard let continuation else {
-            lock.unlock()
-            return
-        }
-        self.continuation = nil
-        task = nil
-        lock.unlock()
-
-        switch result {
-        case let .success(value): continuation.resume(returning: value)
-        case let .failure(error): continuation.resume(throwing: error)
-        }
-    }
 }
