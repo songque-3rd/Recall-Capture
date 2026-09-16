@@ -94,12 +94,46 @@ if ! /usr/bin/afinfo "${audio_file}" | /usr/bin/grep -Eq '1 ch,[[:space:]]+16000
 fi
 
 ditto -x -k "${project_dir}/.build/RecallCapture.zip" "${temporary_root}/archive"
-codesign --verify --deep --strict "${temporary_root}/archive/RecallCapture.app"
-if [[ "$(/usr/bin/plutil -extract LSUIElement raw "${temporary_root}/archive/RecallCapture.app/Contents/Info.plist")" != "false" ]]; then
+packaged_app="${temporary_root}/archive/RecallCapture.app"
+packaged_plist="${packaged_app}/Contents/Info.plist"
+codesign --verify --deep --strict "${packaged_app}"
+if [[ "$(/usr/bin/plutil -extract RecallCaptureSigningMode raw "${packaged_plist}")" != "certificate" ]]; then
+    print -u2 "Release verification requires certificate signing."
+    exit 1
+fi
+signing_identity="$(/usr/bin/plutil -extract RecallCaptureSigningIdentity raw "${packaged_plist}")"
+designated_requirement="$(codesign -d -r- "${packaged_app}" 2>&1 | sed -n 's/^designated => //p')"
+if [[ -z "${designated_requirement}" || "${designated_requirement}" == *cdhash* ]]; then
+    print -u2 "Packaged app does not have a stable designated requirement."
+    exit 1
+fi
+if codesign -d --verbose=4 "${packaged_app}" 2>&1 | grep -Eq 'flags=.*adhoc'; then
+    print -u2 "Packaged app must not use ad-hoc signing."
+    exit 1
+fi
+
+# Prove that a differently hashed update signed by the same identity still
+# satisfies the original build's designated requirement. This is the identity
+# continuity used by macOS privacy controls across app updates.
+update_app="${temporary_root}/update/RecallCapture.app"
+mkdir -p "${temporary_root}/update"
+ditto "${packaged_app}" "${update_app}"
+original_build="$(/usr/bin/plutil -extract CFBundleVersion raw "${update_app}/Contents/Info.plist")"
+/usr/bin/plutil -replace CFBundleVersion -string "$((original_build + 1))" "${update_app}/Contents/Info.plist"
+codesign --force --deep --sign "${signing_identity}" "${update_app}"
+codesign --verify --deep --strict -R "=${designated_requirement}" "${update_app}"
+original_cdhash="$(codesign -d --verbose=4 "${packaged_app}" 2>&1 | sed -n 's/^CDHash=//p')"
+update_cdhash="$(codesign -d --verbose=4 "${update_app}" 2>&1 | sed -n 's/^CDHash=//p')"
+if [[ -z "${original_cdhash}" || -z "${update_cdhash}" || "${original_cdhash}" == "${update_cdhash}" ]]; then
+    print -u2 "Update identity verification did not exercise a different code hash."
+    exit 1
+fi
+
+if [[ "$(/usr/bin/plutil -extract LSUIElement raw "${packaged_plist}")" != "false" ]]; then
     print -u2 "Packaged app must show a Dock icon."
     exit 1
 fi
-if [[ "$(/usr/bin/plutil -extract CFBundleIconFile raw "${temporary_root}/archive/RecallCapture.app/Contents/Info.plist")" != "RecallCapture.icns" ]]; then
+if [[ "$(/usr/bin/plutil -extract CFBundleIconFile raw "${packaged_plist}")" != "RecallCapture.icns" ]]; then
     print -u2 "Packaged app does not declare the Recall Capture icon."
     exit 1
 fi
@@ -115,3 +149,4 @@ if [[ ! -s "${temporary_root}/verified.iconset/icon_512x512@2x.png" ]]; then
 fi
 
 print "verification: passed"
+print "signing continuity: ${designated_requirement}"

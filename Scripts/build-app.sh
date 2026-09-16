@@ -12,8 +12,34 @@ staging_dir="$(mktemp -d)"
 staged_app_dir="${staging_dir}/RecallCapture.app"
 staged_archive="${staging_dir}/RecallCapture.zip"
 icon_generator="${staging_dir}/generate-app-icon"
-signing_identity="${RECALL_CAPTURE_SIGN_IDENTITY:--}"
+local_signing_identity="Recall Capture Local Signing"
+signing_identity="${RECALL_CAPTURE_SIGN_IDENTITY:-}"
+allow_ad_hoc="${RECALL_CAPTURE_ALLOW_AD_HOC:-0}"
 trap 'rm -rf "${staging_dir}"' EXIT
+
+if [[ -z "${signing_identity}" ]]; then
+    if security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"${local_signing_identity}\""; then
+        signing_identity="${local_signing_identity}"
+    elif [[ "${allow_ad_hoc}" == "1" ]]; then
+        signing_identity="-"
+    else
+        print -u2 "No stable code-signing identity is available."
+        print -u2 "Run ./Scripts/setup-local-signing-identity.sh once, then rebuild."
+        print -u2 "For disposable test builds only, set RECALL_CAPTURE_ALLOW_AD_HOC=1."
+        exit 1
+    fi
+fi
+
+if [[ "${signing_identity}" == "-" && "${allow_ad_hoc}" != "1" ]]; then
+    print -u2 "Ad-hoc signing must be explicitly enabled with RECALL_CAPTURE_ALLOW_AD_HOC=1."
+    exit 1
+fi
+
+if [[ "${signing_identity}" != "-" ]] \
+    && ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"${signing_identity}\""; then
+    print -u2 "Code-signing identity is not available: ${signing_identity}"
+    exit 1
+fi
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     print -u2 "Recall Capture v1 requires an Apple Silicon Mac."
@@ -97,11 +123,18 @@ if [[ "${signing_identity}" == "-" ]]; then
 else
     plutil -insert RecallCaptureSigningMode -string "certificate" "${staged_app_dir}/Contents/Info.plist"
 fi
+plutil -insert RecallCaptureSigningIdentity -string "${signing_identity}" "${staged_app_dir}/Contents/Info.plist"
 plutil -lint "${staged_app_dir}/Contents/Info.plist"
 codesign --force --deep --sign "${signing_identity}" "${staged_app_dir}"
 codesign --verify --deep --strict "${staged_app_dir}"
 if [[ "${signing_identity}" == "-" ]]; then
     print -u2 "Warning: ad-hoc signing is for local testing; macOS may require permissions again after rebuilding."
+else
+    designated_requirement="$(codesign -d -r- "${staged_app_dir}" 2>&1 | sed -n 's/^designated => //p')"
+    if [[ -z "${designated_requirement}" || "${designated_requirement}" == *cdhash* ]]; then
+        print -u2 "Certificate signing did not produce a stable designated requirement."
+        exit 1
+    fi
 fi
 ditto -c -k --keepParent "${staged_app_dir}" "${staged_archive}"
 
@@ -118,3 +151,4 @@ cp "${staged_archive}" "${archive_path}"
 
 print "Built: ${app_dir}"
 print "Archive: ${archive_path}"
+print "Signing identity: ${signing_identity}"

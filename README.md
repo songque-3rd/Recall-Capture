@@ -13,19 +13,29 @@
 
 ## ビルドと起動
 
+初回だけ、このMac専用の安定したコード署名証明書をログインキーチェーンへ作成します。macOSの認証画面が表示された場合は許可してください。
+
+```sh
+./Scripts/setup-local-signing-identity.sh
+```
+
+以後は同じ証明書が自動選択されます。
+
 ```sh
 ./Scripts/build-app.sh
 ditto -x -k .build/RecallCapture.zip "$HOME/Applications"
 open "$HOME/Applications/RecallCapture.app"
 ```
 
-生成物は `.build/RecallCapture.app` と、持ち運び用の署名済み `.build/RecallCapture.zip` です。File Provider 管理下の作業フォルダでは `.app` に Finder 属性が付いて署名検証を妨げる場合があるため、起動・移行には ZIP を展開したアプリを使ってください。別の対応 Mac では ZIP だけを移して展開すれば利用でき、Swift や Homebrew の導入は不要です。個人利用を想定した ad-hoc 署名のため、別の Mac へ移した後の初回起動時は macOS のセキュリティ確認が表示される場合があります。
+生成物は `.build/RecallCapture.app` と、持ち運び用の署名済み `.build/RecallCapture.zip` です。File Provider 管理下の作業フォルダでは `.app` に Finder 属性が付いて署名検証を妨げる場合があるため、起動・移行には ZIP を展開したアプリを使ってください。
 
-開発中の再ビルド後も同じプライバシー許可を維持するには、実在するコード署名証明書を指定します。証明書を指定しない ad-hoc 署名では、バイナリが変わるたびに macOS が別のアプリとして扱い、マイクや画面収録の再許可が必要になる場合があります。
+標準ビルドは安定した証明書がない場合に停止し、更新ごとに識別条件が変わる ad-hoc 署名へ黙って戻りません。Apple Developerの証明書を持っている場合は、次のように上書きできます。
 
 ```sh
 RECALL_CAPTURE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./Scripts/build-app.sh
 ```
+
+このMac専用の証明書は、同じMacで更新時のマイク・画面収録・音声認識許可を維持するためのものです。別のMacへ信頼済みアプリとして配布する場合は、Apple Developerの証明書と公証を使用してください。使い捨ての動作確認だけは `RECALL_CAPTURE_ALLOW_AD_HOC=1 ./Scripts/build-app.sh` で明示的にad-hoc署名を選べます。
 
 起動すると独自の「波形＋赤い録音ドット」アイコンが Dock と Finder に表示されます。メニューバーにも「波形＋Recall」が常時表示され、どちらからでも録音を開始できます。
 
@@ -62,7 +72,7 @@ Appleのオンデバイス認識が対象言語で利用できない場合、ネ
 
 画面収録がシステム設定でオンなのにアプリでは未許可になる場合は、最初にRecall Captureを完全終了して起動し直してください。画面収録設定の変更は、実行中のアプリには反映されません。再起動後も未許可なら、システム設定の「画面収録とシステムオーディオ録音」でRecallCaptureを一度オフにしてからオンへ戻し、もう一度再起動します。それでも直らない場合は、同じ設定画面の `-` でRecallCaptureを削除してからアプリを起動し、録音操作によって現在のビルドを再登録します。
 
-再ビルドを繰り返す開発環境では、一時署名ではなく同じApple Development証明書を `RECALL_CAPTURE_SIGN_IDENTITY` に指定してください。一時署名のビルドでは、設定画面にも再許可が必要であることを表示します。
+以前のad-hoc署名版から安定署名版へ切り替える最初の1回だけは、macOSから別の識別条件として扱われるため、権限を許可し直す必要があります。その後は同じ `Recall Capture Local Signing` 証明書を削除せずに使い続けてください。証明書を削除・再作成すると識別条件が変わります。一時署名のビルドでは、設定画面にも再許可が必要であることを表示します。
 
 ## 動画・字幕の扱い
 
@@ -70,7 +80,7 @@ YouTube や bilibili は会議録音とは入力経路が異なるため、v1 �
 
 ## 検証
 
-アプリのビルド、データ保存・復旧、音声のチャンク化、文字起こし成果物の生成、PDFの読み戻し、ZIP 展開後の署名をまとめて検証できます。
+アプリのビルド、データ保存・復旧、音声のチャンク化、文字起こし成果物の生成、PDFの読み戻し、ZIP 展開後の署名に加え、コードハッシュが異なる更新版でも旧版の指定要件を満たすことをまとめて検証できます。
 
 ```sh
 ./Scripts/verify.sh
