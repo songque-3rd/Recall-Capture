@@ -12,15 +12,45 @@
 
 **Apple Intelligenceは不要です。** 音声認識にApple Speech、話者分離に同梱のNemotron 3 Diarizationを使用します。対応するローカル認識が利用できない場合はエラーを表示し、クラウド認識へ切り替えません。アカウント、APIキー、利用者によるHomebrewや証明書の導入は不要です。
 
-配布用ZIPは、Developer ID署名・Appleの公証・Gatekeeper検証を済ませたものを使用します。リリースが公開されたら、添付のSHA-256を確認し、ZIPを展開して `RecallCapture.app` をアプリケーションフォルダに移動してください。現時点で公開済みバイナリは案内していません。公開前の確認項目は [配布手順](RELEASING.md) に記載しています。
+ソースコードは公開済みです。配布用アプリのZIPは、Developer ID署名・Appleの公証・Gatekeeper検証を済ませてから [GitHub Releases](https://github.com/songque-3rd/Recall-Capture/releases) で公開します。現在は署名・公証の準備待ちで、配布用ZIPはまだありません。公開までは [ソースからビルド](#ソースからビルド) してください。公開前の確認項目は [配布手順](RELEASING.md) に記載しています。
+
+### 配布用ZIPのダウンロードから起動まで
+
+以下は、配布用ZIPの公開後に使う手順です。
+
+1. [GitHub Releases](https://github.com/songque-3rd/Recall-Capture/releases) で使用するバージョンを開き、Assetsから `RecallCapture-<バージョン>-macos-arm64.zip` と、同じ名前に `.sha256` が付いたファイルをダウンロードします。`Source code (zip)` と、リポジトリの「Code > Download ZIP」はソースコードです。そのままアプリとして起動することはできません。
+2. ZIPと `.sha256` を同じフォルダに置き、ターミナルでチェックサムを確認します。次はダウンロードフォルダに保存したバージョン0.5.0の例です。ファイル名はダウンロードしたバージョンに合わせてください。
+
+   ```sh
+   cd ~/Downloads
+   shasum -a 256 -c RecallCapture-0.5.0-macos-arm64.zip.sha256
+   ```
+
+   結果が `OK` なら次へ進みます。一致しない場合は起動せず、ファイルをダウンロードし直してください。ブラウザがZIPを自動展開した場合も、確認には元のZIPを使います。
+3. ZIPをダブルクリックして展開し、`RecallCapture.app` をFinderの「アプリケーション」フォルダへ移動します。
+4. 「アプリケーション」フォルダの `RecallCapture.app` をダブルクリックします。初回にmacOSから確認が表示されたら「開く」を選びます。
+
+開発元を確認できない、アプリが壊れているなどの警告で開けない場合は、配布元とチェックサムを確認してください。解決しない場合は、macOSのバージョンと警告文を [Issues](https://github.com/songque-3rd/Recall-Capture/issues) に記載してください。
+
+### 初回起動と録音
+
+1. アプリで保存先、使用するマイク、認識言語を確認します。従来方式の音声認識を使う場合は、システム設定の「キーボード > 音声入力」もオンにします。
+2. オンライン会議または対面授業の録音を開始します。初回はマイクと音声認識を許可します。オンライン会議では、PC音声を取得するため画面収録も許可します。画面映像は保存しません。
+3. 録音画面の入力メーターで音声が入っていることを確認します。権限を変更しても反映されない場合は、設定の「権限とデータ」で状態を確認してください。画面収録の許可後に反映されない場合は、アプリを完全終了して起動し直します。
+4. 録音を停止し、文字起こしが終わったら「文字起こし全文」から全文を開きます。「保存先」からは、録音と全文を保存したセッションフォルダを開けます。
+
+詳しい操作とトラブル対処は [利用ガイド](Resources/UsageGuide.md)、権限の用途は [権限](#権限) を参照してください。
 
 ## ソースからビルド
 
 開発にはApple Silicon、Swift 6.2以降とmacOS 26以降のSDK（Xcode 26以降、または対応するCommand Line Tools）、Git、CMake、Ninjaを使います。実行対象の最小OSはmacOS 15です。必要なビルドツールは任意の方法で用意できます（Homebrewなら `brew install cmake ninja`）。
 
+リポジトリの「Code > Download ZIP」で取得したソースを展開し、ターミナルでそのフォルダへ移動してから実行します。たとえば、ダウンロードフォルダに `Recall-Capture-main` として展開した場合は、最初に `cd ~/Downloads/Recall-Capture-main` を実行してください。
+
 ```sh
 ./Scripts/setup-nemotron-diarization.sh
 RECALL_CAPTURE_SIGN_IDENTITY=- RECALL_CAPTURE_ALLOW_AD_HOC=1 ./Scripts/build-app.sh
+open .build/RecallCapture.app
 ```
 
 セットアップは固定コミットのNeMo-Speech.cppとSentencePieceをビルドし、固定リビジョンのモデルを取得します。モデルのサイズ・SHA-256と実行ファイルの外部依存を検証し、ランタイム、モデル、ライセンスをアプリへ同梱します。利用するMacにPythonやCMakeを入れる必要はありません。
