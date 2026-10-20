@@ -52,7 +52,7 @@ public struct RecordingManifest: Codable, Equatable, Sendable {
     public let startedAt: String
     public private(set) var status: RecordingStatus
     public let chunkDurationSeconds: Int
-    public let maximumDurationSeconds: Int
+    public private(set) var maximumDurationSeconds: Int
     public let tracks: [AudioTrack]
     public private(set) var chunks: [AudioChunkDescriptor]
     public private(set) var updatedAt: String
@@ -82,7 +82,7 @@ public struct RecordingManifest: Codable, Equatable, Sendable {
         startedAt: Date,
         tracks: [AudioTrack],
         chunkDurationSeconds: Int = 60,
-        maximumDurationSeconds: Int = 10_800
+        maximumDurationSeconds: Int = RecordingLimit.defaultSeconds
     ) {
         let timestamp = Self.timestamp(startedAt)
         self.schemaVersion = "1.0"
@@ -98,6 +98,11 @@ public struct RecordingManifest: Codable, Equatable, Sendable {
         self.chunks = []
         self.updatedAt = timestamp
         self.lastError = nil
+    }
+
+    public mutating func setMaximumDuration(seconds: Int, at date: Date = .now) {
+        maximumDurationSeconds = seconds
+        updatedAt = Self.timestamp(date)
     }
 
     public mutating func append(_ chunk: AudioChunkDescriptor, at date: Date = .now) {

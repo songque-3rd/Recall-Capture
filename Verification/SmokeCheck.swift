@@ -76,17 +76,11 @@ enum SmokeCheck {
             throw SmokeCheckError.invalidJSONL
         }
 
-        let summary = LocalSummaryBuilder().build(metadata: metadata, utterances: utterances)
-        guard summary.sections.map(\.title) == ["講義の主要内容", "復習ポイント"],
-              summary.sections[1].items.contains(where: { $0.contains("課題") }) else {
-            throw SmokeCheckError.invalidSummary
+        try TranscriptMarkdownWriter().write(metadata: metadata, utterances: utterances, to: location.transcriptMarkdown)
+        let decoded = try TranscriptJSONLWriter().read(from: location.transcriptJSONL)
+        guard decoded.metadata == metadata, decoded.utterances == utterances else {
+            throw SmokeCheckError.invalidJSONL
         }
-        try SummaryPDFWriter().write(
-            summary: summary,
-            metadata: metadata,
-            to: location.summaryPDF
-        )
-        try SummaryPDFWriter().validate(location.summaryPDF)
 
         var stateMachine = SessionStateMachine()
         try stateMachine.transition(to: .recording)
@@ -178,9 +172,21 @@ enum SmokeCheck {
             throw SmokeCheckError.invalidBrowserWindowFiltering
         }
 
+        let timeline = RTTMParser.parse("""
+        SPEAKER session 1 0.00 1.20 <NA> <NA> speaker_01 <NA> <NA>
+        SPEAKER session 1 1.20 1.80 <NA> <NA> speaker_02 <NA> <NA>
+        SPEAKER session 1 2.90 0.50 <NA> <NA> speaker_03 <NA> <NA>
+        """)
+        guard timeline.segments.count == 3,
+              timeline.speakerLabel(startMilliseconds: 1_300, endMilliseconds: 2_700) == "speaker_02",
+              timeline.speakerLabel(startMilliseconds: 2_950, endMilliseconds: 3_100) == nil,
+              timeline.speakerLabel(startMilliseconds: 900, endMilliseconds: 1_500) == nil else {
+            throw SmokeCheckError.invalidSpeakerDiarization
+        }
+
         print("smoke-check: passed")
         print(location.transcriptJSONL.path)
-        print(location.summaryPDF.path)
+        print(location.transcriptMarkdown.path)
     }
 }
 
@@ -189,9 +195,9 @@ enum SmokeCheckError: Error {
     case invalidFixture
     case unexpectedSessionPath(String)
     case invalidJSONL
-    case invalidSummary
     case invalidTransitionAccepted
     case invalidRecordingManifest
     case invalidBrowserWindowFiltering
     case invalidRecentRecordingPersistence
+    case invalidSpeakerDiarization
 }

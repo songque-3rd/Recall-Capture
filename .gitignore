@@ -1,3 +1,14 @@
 .build/
 .swiftpm/
+.artifacts/
 .DS_Store
+
+# Local credentials and signing material (never distribute these).
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.pem
+*.mobileprovision

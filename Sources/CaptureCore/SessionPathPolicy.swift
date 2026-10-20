@@ -2,13 +2,13 @@ import Foundation
 
 public struct SessionLocation: Equatable, Sendable {
     public let directory: URL
-    public let summaryPDF: URL
     public let transcriptJSONL: URL
+    public let transcriptMarkdown: URL
 
     public init(directory: URL) {
         self.directory = directory
-        self.summaryPDF = directory.appendingPathComponent("summary.pdf", isDirectory: false)
         self.transcriptJSONL = directory.appendingPathComponent("transcript.jsonl", isDirectory: false)
+        self.transcriptMarkdown = directory.appendingPathComponent("transcript.md", isDirectory: false)
     }
 }
 

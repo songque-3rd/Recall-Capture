@@ -104,10 +104,12 @@ final class ChunkedAudioWriter {
             throw AudioCaptureError.invalidSampleRate
         }
 
+        guard buffer.frameLength > 0 else { return nil }
         var completed: AudioChunkDescriptor?
         if let inputFormat,
            (!Self.formatsMatch(inputFormat, buffer.format)
-            || durationSeconds + Double(buffer.frameLength) / buffer.format.sampleRate > chunkDurationSeconds),
+            || durationSeconds + Double(buffer.frameLength) / buffer.format.sampleRate > chunkDurationSeconds
+            || abs(Double(sessionTimestampMilliseconds - currentChunkStartMilliseconds) / 1_000 - durationSeconds) > 0.1),
            currentFrameCount > 0 {
             completed = try finalizeCurrentChunk()
         }

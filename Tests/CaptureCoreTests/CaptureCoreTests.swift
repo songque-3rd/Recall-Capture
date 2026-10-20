@@ -19,7 +19,6 @@ struct CaptureCoreTests {
         )
 
         #expect(location.directory.path == "/output/2026/2026-09/2026-09-15_1030__情報科学-第3回__a7f3")
-        #expect(location.summaryPDF.lastPathComponent == "summary.pdf")
         #expect(location.transcriptJSONL.lastPathComponent == "transcript.jsonl")
     }
 
@@ -293,5 +292,36 @@ struct CaptureCoreTests {
         let filtered = BrowserWindowFilter.visibleUniqueWindows(from: windows)
         #expect(Set(filtered.map(\.id)) == Set([1, 6, 11, 12]))
         #expect(Set(filtered.prefix(3).map(\.id)) == Set([1, 11, 12]))
+    }
+
+    @Test("RTTMを匿名話者タイムラインへ変換する")
+    func parsesRTTM() throws {
+        let timeline = RTTMParser.parse("""
+        SPEAKER recording 1 0.500 1.000 <NA> <NA> speaker_2 <NA> <NA>
+        SPEAKER recording 1 1.500 0.500 <NA> <NA> speaker_2 <NA> <NA>
+        SPEAKER recording 1 invalid 0.500 <NA> <NA> speaker_3 <NA> <NA>
+        """)
+
+        #expect(timeline.segments.count == 2)
+        #expect(timeline.speakerLabel(startMilliseconds: 400, endMilliseconds: 2_100) == "speaker_02")
+    }
+
+    @Test("複数話者が重なる発話はunknownへ倒す")
+    func rejectsOverlappingSpeakers() {
+        let timeline = SpeakerTimeline(segments: [
+            SpeakerActivitySegment(startMilliseconds: 0, endMilliseconds: 1_000, speakerNumber: 1),
+            SpeakerActivitySegment(startMilliseconds: 800, endMilliseconds: 1_600, speakerNumber: 2),
+        ])
+
+        #expect(timeline.speakerLabel(startMilliseconds: 400, endMilliseconds: 1_200) == nil)
+    }
+
+    @Test("話者根拠が短すぎる発話はunknownへ倒す")
+    func rejectsSparseSpeakerEvidence() {
+        let timeline = SpeakerTimeline(segments: [
+            SpeakerActivitySegment(startMilliseconds: 0, endMilliseconds: 80, speakerNumber: 1),
+        ])
+
+        #expect(timeline.speakerLabel(startMilliseconds: 0, endMilliseconds: 1_000) == nil)
     }
 }

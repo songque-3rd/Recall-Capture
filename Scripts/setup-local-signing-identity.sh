@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+umask 077
 
 identity_name="Recall Capture Local Signing"
 keychain_path="$(security default-keychain -d user | sed -E 's/^[[:space:]]*"(.*)"[[:space:]]*$/\1/')"
@@ -33,8 +34,8 @@ else
         -nodes \
         -days 3650 \
         -subj "/C=JP/O=Recall Capture/CN=${identity_name}" \
-        -addext "basicConstraints=critical,CA:TRUE" \
-        -addext "keyUsage=critical,digitalSignature,keyCertSign" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=critical,digitalSignature" \
         -addext "extendedKeyUsage=critical,codeSigning" \
         -keyout "${private_key_path}" \
         -out "${certificate_path}"
@@ -54,7 +55,7 @@ else
 fi
 
 print "macOS may ask for authentication to trust the local signing certificate."
-security add-trusted-cert -r trustRoot -k "${keychain_path}" "${certificate_path}"
+security add-trusted-cert -r trustRoot -p codeSign -k "${keychain_path}" "${certificate_path}"
 
 if ! has_valid_identity; then
     print -u2 "The certificate is present but is not a usable code-signing identity."

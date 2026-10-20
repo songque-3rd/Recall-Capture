@@ -14,7 +14,7 @@ struct RecallCaptureApp: App {
                     model.handleLaunchArgumentsIfNeeded()
                 }
         }
-        .defaultSize(width: 600, height: 560)
+        .defaultSize(width: 720, height: 760)
 
         MenuBarExtra {
             CaptureMenu(model: model)
@@ -95,14 +95,25 @@ final class AppModel: ObservableObject {
     @Published private(set) var saveDirectoryURL: URL
     @Published private(set) var permissionSnapshot = CapturePermissionSnapshot(
         microphone: .notDetermined,
-        screenRecording: .notDetermined
+        screenRecording: .unconfirmed
     )
     @Published private(set) var message = "録音を開始できます。"
     @Published private(set) var isStarting = false
     @Published private(set) var isStopping = false
     @Published private(set) var isProcessing = false
     @Published private var now = Date()
-    @Published var languageMode = LanguageMode.japanese
+    @Published var languageMode = LanguageMode.japanese {
+        didSet { UserDefaults.standard.set(languageMode.rawValue, forKey: "recognitionLanguage") }
+    }
+    @Published var recordingLimitMinutes = 120 {
+        didSet { UserDefaults.standard.set(recordingLimitMinutes, forKey: "recordingLimitMinutes") }
+    }
+    @Published private(set) var remainingSeconds = RecordingLimit.defaultSeconds
+    @Published private(set) var inputLevels: [AudioTrack: AudioInputSnapshot] = [:]
+    @Published private(set) var limitWarning: String?
+    private var recordingLimit = RecordingLimit()
+    private var recordingClockStart: ContinuousClock.Instant?
+    private lazy var notifications = RecordingNotifications()
 
     private let permissionService = CapturePermissionService()
     private let destinationStore: RecordingDestinationStore
@@ -110,7 +121,6 @@ final class AppModel: ObservableObject {
     private var stateMachine = SessionStateMachine()
     private var activeWorkspace: RecordingWorkspacePaths?
     private var clockTask: Task<Void, Never>?
-    private var automaticStopTask: Task<Void, Never>?
     private var didHandleLaunchArguments = false
 
     private lazy var coordinator = RecordingCoordinator(workspaceRoot: saveDirectoryURL) { [weak self] errorMessage in
@@ -127,6 +137,9 @@ final class AppModel: ObservableObject {
         self.recentRecordingStore = recentRecordingStore
         saveDirectoryURL = destinationStore.load(defaultURL: RecordingCoordinator.defaultWorkspaceRoot())
         lastWorkspaceURL = recentRecordingStore.load()
+        languageMode = LanguageMode(rawValue: UserDefaults.standard.string(forKey: "recognitionLanguage") ?? "") ?? .japanese
+        let savedMinutes = UserDefaults.standard.integer(forKey: "recordingLimitMinutes")
+        recordingLimitMinutes = savedMinutes == 0 ? 120 : min(720, max(5, savedMinutes))
         refreshPermissions()
         refreshMicrophones()
         refreshRecoveryCandidates()
@@ -134,18 +147,32 @@ final class AppModel: ObservableObject {
 
     deinit {
         clockTask?.cancel()
-        automaticStopTask?.cancel()
     }
 
     var isRecording: Bool { state == .recording }
-    var canStart: Bool { state == .idle && !isStarting && !isStopping && !isProcessing }
+    var canStart: Bool { (state == .idle || state == .failed) && !isStarting && !isStopping && !isProcessing }
+    var canOpenTranscript: Bool { artifactExists("transcript.md") || artifactExists("transcript.jsonl") }
+    var statusLabel: String {
+        if isStarting { return "録音を準備中" }
+        if isStopping { return "音声を保存中" }
+        if isProcessing {
+            return switch state {
+            case .detectingSpeech, .transcribing: "文字起こし中"
+            case .diarizing: "話者を整理中"
+            case .formatting: "全文を整形中"
+            case .writingArtifacts, .validatingArtifacts: "成果物を保存中"
+            default: "後処理中"
+            }
+        }
+        return isRecording ? "録音中" : (state == .failed ? "録音の復旧が必要" : "録音の準備ができています")
+    }
     var usesAdHocSigning: Bool {
         Bundle.main.object(forInfoDictionaryKey: "RecallCaptureSigningMode") as? String == "ad-hoc"
     }
 
     var elapsedDescription: String {
         guard let startedAt else { return "--:--:--" }
-        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        let seconds = max(0, Int(isRecording ? recordingElapsedSeconds : now.timeIntervalSince(startedAt)))
         return String(
             format: "%02d:%02d:%02d",
             seconds / 3_600,
@@ -185,13 +212,25 @@ final class AppModel: ObservableObject {
 
     func recheckPermissions() {
         refreshPermissions()
-        if permissionSnapshot.screenRecording == .denied {
+        if permissionSnapshot.screenRecording == .unconfirmed {
             message = screenRecordingRecoveryMessage
         } else if permissionSnapshot.microphone == .denied {
             message = "マイクが未許可です。マイク設定でRecall Captureをオンにしてください。"
+        } else if permissionSnapshot.speechRecognition != .authorized {
+            message = "音声認識が未許可です。録音開始時に確認し、拒否済みの場合は設定から変更してください。"
+        } else if permissionSnapshot.microphone == .authorized && permissionSnapshot.screenRecording == .authorized {
+            message = "マイク・画面収録・音声認識の権限を確認できました。"
         } else {
-            message = "マイクと画面収録の権限を確認できました。"
+            message = "権限の状態を更新しました。録音開始時に必要な許可を確認します。"
         }
+    }
+
+    func openUsageGuide() {
+        guard let url = Bundle.main.url(forResource: "UsageGuide", withExtension: "md") else {
+            message = "利用手順が見つかりません。READMEの起動手順を確認してください。"
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     func openMicrophonePrivacySettings() {
@@ -265,6 +304,31 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func artifactExists(_ name: String) -> Bool {
+        guard let lastWorkspaceURL else { return false }
+        return FileManager.default.fileExists(atPath: lastWorkspaceURL.appendingPathComponent(name).path)
+    }
+
+    func openTranscript() {
+        guard let lastWorkspaceURL, canOpenTranscript else { return }
+        let location = SessionLocation(directory: lastWorkspaceURL)
+        do {
+            // Older completed sessions can gain Markdown without rerunning recognition.
+            if !artifactExists("transcript.md") {
+                let transcript = try TranscriptJSONLWriter().read(from: location.transcriptJSONL)
+                try TranscriptMarkdownWriter().write(
+                    metadata: transcript.metadata, utterances: transcript.utterances,
+                    to: location.transcriptMarkdown
+                )
+            }
+            if !NSWorkspace.shared.open(location.transcriptMarkdown) {
+                NSWorkspace.shared.activateFileViewerSelecting([location.transcriptMarkdown])
+            }
+        } catch {
+            message = "文字起こし全文を開けません: \(error.localizedDescription)"
+        }
+    }
+
     func revealLastWorkspace() {
         guard let lastWorkspaceURL else {
             message = "完了した録音はまだありません。"
@@ -294,6 +358,10 @@ final class AppModel: ObservableObject {
                 message = "このRecall Captureからマイクを利用できません。設定画面で権限を再確認してください。"
                 return
             }
+            guard await requestSpeechRecognitionPermission() else {
+                message = "文字起こしには音声認識の許可が必要です。音声認識設定でRecall Captureを許可してください。端末の管理制限がある場合は管理者へ確認してください。"
+                return
+            }
             do {
                 let workspace = try await coordinator.startMeet(
                     windowID: window.id,
@@ -321,6 +389,10 @@ final class AppModel: ObservableObject {
                 message = "このRecall Captureからマイクを利用できません。設定画面で権限を再確認してください。"
                 return
             }
+            guard await requestSpeechRecognitionPermission() else {
+                message = "文字起こしには音声認識の許可が必要です。音声認識設定でRecall Captureを許可してください。端末の管理制限がある場合は管理者へ確認してください。"
+                return
+            }
             do {
                 let workspace = try await coordinator.startClassroom(
                     microphoneDeviceID: microphoneID,
@@ -339,12 +411,15 @@ final class AppModel: ObservableObject {
     func stopRecording(automatic: Bool = false) {
         guard activeWorkspace != nil, !isStopping, !isProcessing else { return }
         isStopping = true
+        let hasSound = inputLevels.values.contains { $0.hasRecentSound(at: .now) }
         cancelTimers()
+        notifications.clearWarnings()
+        if automatic { notifications.stopped(hasSound: hasSound) }
         if state == .recording {
             try? transition(to: .finalizingAudio)
         }
         message = automatic
-            ? "3時間に達したため録音を自動停止し、音声を確定しています…"
+            ? "設定した時間に達したため録音を自動停止し、音声を確定しています…"
             : "録音を停止し、音声を確定しています…"
 
         Task {
@@ -355,7 +430,7 @@ final class AppModel: ObservableObject {
                 startedAt = nil
                 isStopping = false
                 message = automatic
-                    ? "3時間で自動停止しました。文字起こしを開始します…"
+                    ? "上限時間で自動停止しました。文字起こしを開始します…"
                     : "録音を停止しました。文字起こしを開始します…"
                 await process(workspace: result.workspace, manifest: result.manifest)
             } catch {
@@ -374,7 +449,7 @@ final class AppModel: ObservableObject {
     func resumePostProcessing() {
         guard canStart, let candidate = actionableRecoveryCandidates().last else { return }
         setLastWorkspace(candidate.paths.directory)
-        message = "保存済み音声から後処理を再開します…"
+        message = "保存済みデータから後処理を再開します…"
         Task {
             await process(workspace: candidate.paths, manifest: candidate.manifest)
             refreshRecoveryCandidates()
@@ -394,6 +469,7 @@ final class AppModel: ObservableObject {
         manifest: RecordingManifest
     ) async {
         isProcessing = true
+        setLastWorkspace(workspace.directory)
         defer { isProcessing = false }
         if state == .idle || state == .failed || state == .completed {
             stateMachine = SessionStateMachine()
@@ -413,14 +489,17 @@ final class AppModel: ObservableObject {
             try transition(to: .completed)
             setLastWorkspace(result.workspace.directory)
             resetToIdle()
-            message = "文字起こし（\(result.utteranceCount)件）と要約PDFを作成しました。"
+            message = "話者付きの全文（\(result.utteranceCount)発話）をMarkdownとJSONLに保存しました。"
+            if !result.warnings.isEmpty { message += " " + result.warnings.joined(separator: " ") }
         } catch {
             if state != .failed {
                 try? transition(to: .failed)
             }
             stateMachine = SessionStateMachine()
             state = .idle
-            message = "後処理を完了できませんでした: \(error.localizedDescription)"
+            message = canOpenTranscript
+                ? "全文は保存済みですが、後処理を完了できませんでした: \(error.localizedDescription) 保存済みの全文から再試行できます。"
+                : "後処理を完了できませんでした: \(error.localizedDescription)"
         }
     }
 
@@ -432,9 +511,7 @@ final class AppModel: ObservableObject {
             case .transcribing: "端末内で文字起こししています…"
             case .diarizing: "音声トラックから話者を整理しています…"
             case .formatting: "文字起こしを整形しています…"
-            case .summarizingChunks: "発話の要点を抽出しています…"
-            case .summarizingOverall: "全体要約を組み立てています…"
-            case .writingArtifacts: "文字起こしJSONLと要約PDFを書き出しています…"
+            case .writingArtifacts: "全文Markdown・JSONLを保存しています…"
             case .validatingArtifacts: "作成した成果物を検証しています…"
             default: message
             }
@@ -449,10 +526,7 @@ final class AppModel: ObservableObject {
                   [.readyForProcessing, .processing, .failed].contains(candidate.manifest.status) else {
                 return false
             }
-            let location = SessionLocation(directory: candidate.paths.directory)
-            let hasTranscript = FileManager.default.fileExists(atPath: location.transcriptJSONL.path)
-            let hasPDF = FileManager.default.fileExists(atPath: location.summaryPDF.path)
-            return !(hasTranscript && hasPDF)
+            return true
         }
     }
 
@@ -492,6 +566,7 @@ final class AppModel: ObservableObject {
         do {
             try RecordingStorageValidator().validate(root: saveDirectoryURL)
             try coordinator.updateWorkspaceRoot(saveDirectoryURL)
+            try coordinator.setMaximumDuration(seconds: recordingLimitMinutes * 60)
             return true
         } catch {
             message = "録音を開始できません: \(error.localizedDescription)"
@@ -511,6 +586,12 @@ final class AppModel: ObservableObject {
         return granted
     }
 
+    private func requestSpeechRecognitionPermission() async -> Bool {
+        let granted = await permissionService.requestSpeechRecognitionIfNeeded()
+        refreshPermissions()
+        return granted
+    }
+
     private func openPrivacySettings(anchor: String, name: String) {
         guard let url = URL(
             string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
@@ -519,7 +600,7 @@ final class AppModel: ObservableObject {
             return
         }
         if anchor == "Privacy_ScreenCapture" {
-            message = "画面収録設定の変更は再起動後に反映されます。Recall Captureを完全終了してから起動し直してください。"
+            message = "画面収録を許可し、戻ったら『権限を再確認』を押してください。反映されない場合はRecall Captureを完全終了して起動し直してください。"
         } else {
             message = "システム設定でRecall Captureの\(name)権限を確認し、戻ったら『権限を再確認』を押してください。"
         }
@@ -534,29 +615,64 @@ final class AppModel: ObservableObject {
         state = stateMachine.state
     }
 
+    var remainingDescription: String {
+        String(format: "%02d:%02d:%02d", remainingSeconds / 3_600, remainingSeconds / 60 % 60, remainingSeconds % 60)
+    }
+
+    func extendRecording() {
+        guard isRecording, !isStopping, recordingLimit.durationSeconds < RecordingLimit.maximumSeconds else { return }
+        var extended = recordingLimit
+        extended.extend()
+        do {
+            try coordinator.setMaximumDuration(seconds: extended.durationSeconds)
+            recordingLimit = extended
+            remainingSeconds = recordingLimit.remaining(elapsedSeconds: recordingElapsedSeconds)
+            limitWarning = nil
+            notifications.clearWarnings()
+            message = "自動停止までの時間を15分延長しました。"
+        } catch { message = "延長設定を保存できませんでした: \(error.localizedDescription)" }
+    }
+
+    private var recordingElapsedSeconds: Double {
+        guard let start = recordingClockStart else { return 0 }
+        let parts = start.duration(to: .now).components
+        return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+    }
+
     private func startTimers() {
         clockTask?.cancel()
-        clockTask = Task {
+        recordingClockStart = .now
+        recordingLimit = RecordingLimit(seconds: recordingLimitMinutes * 60)
+        remainingSeconds = recordingLimit.durationSeconds
+        limitWarning = nil
+        inputLevels = coordinator.audioInputSnapshot()
+        notifications.clearWarnings()
+        notifications.prepare { [weak self] in self?.extendRecording() }
+        clockTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled else { return }
-                now = .now
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let self else { return }
+                self.now = .now
+                self.inputLevels = self.coordinator.audioInputSnapshot()
+                let elapsed = self.recordingElapsedSeconds
+                self.remainingSeconds = self.recordingLimit.remaining(elapsedSeconds: elapsed)
+                switch self.recordingLimit.poll(elapsedSeconds: elapsed) {
+                case let .warning(minutes):
+                    let hasSound = self.inputLevels.values.contains { $0.hasRecentSound(at: .now) }
+                    self.limitWarning = "あと\(minutes)分で自動停止します。" + (hasSound ? "音声入力が続いています。必要なら延長してください。" : "")
+                    self.notifications.warning(minutes: minutes, hasSound: hasSound)
+                case .stop:
+                    self.stopRecording(automatic: true)
+                    return
+                case nil: break
+                }
             }
-        }
-
-        automaticStopTask?.cancel()
-        automaticStopTask = Task {
-            try? await Task.sleep(for: .seconds(RecordingCoordinator.maximumDurationSeconds))
-            guard !Task.isCancelled else { return }
-            stopRecording(automatic: true)
         }
     }
 
     private func cancelTimers() {
         clockTask?.cancel()
-        automaticStopTask?.cancel()
         clockTask = nil
-        automaticStopTask = nil
     }
 
     private func resetToIdle() {
@@ -597,7 +713,11 @@ private struct CaptureMenu: View {
 
     var body: some View {
         if model.isRecording || model.isStopping || model.isProcessing {
-            Text(model.isProcessing ? "後処理中" : "録音中  \(model.elapsedDescription)")
+            Text("\(model.statusLabel)  \(model.elapsedDescription)")
+            if model.isRecording {
+                Text("自動停止まで \(model.remainingDescription)")
+                Button("15分延長") { model.extendRecording() }
+            }
             Button(model.isProcessing ? "後処理中…" : (model.isStopping ? "停止処理中…" : "録音停止")) {
                 model.stopRecording()
             }
@@ -647,6 +767,8 @@ private struct CaptureMenu: View {
         }
 
         Divider()
+        Button("文字起こし全文を開く") { model.openTranscript() }
+            .disabled(!model.canOpenTranscript)
         Button("保存先をFinderで開く") {
             model.openSaveDirectory()
         }
@@ -675,125 +797,178 @@ private struct MainWindowView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Image(systemName: model.isRecording ? "record.circle.fill" : "waveform")
-                    .font(.title)
-                    .foregroundStyle(model.isRecording ? .red : .primary)
-                Text("Recall Capture")
-                    .font(.title)
-                Spacer()
-                SettingsLink {
-                    Label("設定", systemImage: "gearshape")
-                }
-                .accessibilityLabel("設定を開く")
-            }
-
-            LabeledContent("現在の状態", value: model.state.rawValue)
-            LabeledContent("録音時間", value: model.elapsedDescription)
-            LabeledContent("復旧候補", value: "\(model.recoveryCount)件")
-            Text(model.message)
-                .foregroundStyle(.secondary)
-
-            Divider()
-
-            GroupBox("保存先") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(model.saveDirectoryURL.path)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .lineLimit(2)
-                    HStack {
-                        Button("Finderで開く") {
-                            model.openSaveDirectory()
-                        }
-                        .accessibilityLabel("保存先をFinderで開く")
-                        Button("変更…") {
-                            model.chooseSaveDirectory()
-                        }
-                        .accessibilityLabel("保存先を変更")
-                        .disabled(!model.canStart)
-                        Spacer()
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
-            }
-
-            Text("録音操作")
-                .font(.headline)
-
-            if model.isRecording || model.isStopping || model.isProcessing {
-                Button(model.isProcessing ? "後処理中…" : (model.isStopping ? "停止処理中…" : "録音停止")) {
-                    model.stopRecording()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .disabled(model.isStopping || model.isProcessing)
-            } else {
+            VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 12) {
-                    Menu("オンライン会議を録音") {
-                        ForEach(model.meetWindows) { window in
-                            Button(window.label) {
-                                model.beginMeet(window: window)
-                            }
-                        }
-                        if !model.meetWindows.isEmpty {
-                            Divider()
-                        }
-                        Button("会議ウインドウを読み込む…") {
-                            model.refreshMeetWindows()
-                        }
+                    Image(systemName: "waveform.circle.fill")
+                        .font(.system(size: 38))
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Recall Capture").font(.title2.bold())
+                        Text("音声を、話者付きの全文へ")
+                            .foregroundStyle(.secondary)
                     }
-                    .accessibilityLabel("オンライン会議を録音")
-
-                    Menu("対面授業を録音") {
-                        Button("標準マイク") {
-                            model.beginClassroom(microphoneID: nil)
-                        }
-                        ForEach(model.microphones) { microphone in
-                            Button(microphone.name) {
-                                model.beginClassroom(microphoneID: microphone.id)
-                            }
-                        }
-                        Divider()
-                        Button("マイク一覧を更新") {
-                            model.refreshMicrophones()
-                        }
-                    }
-                    .accessibilityLabel("対面授業を録音")
-                }
-                .disabled(!model.canStart)
-            }
-
-            if model.recoveryCount > 0 {
-                Button("保存済み音声の後処理を再開") {
-                    model.resumePostProcessing()
-                }
-                .disabled(!model.canStart)
-            }
-
-            if let url = model.lastWorkspaceURL {
-                Text("直近の保存先")
-                    .font(.headline)
-                HStack {
-                    Text(url.path)
-                        .font(.caption)
-                        .textSelection(.enabled)
-                        .lineLimit(2)
                     Spacer()
-                    Button("Finderで表示") {
-                        model.revealLastWorkspace()
-                    }
-                    .accessibilityLabel("直近の録音をFinderで表示")
+                    Button { model.openUsageGuide() } label: { Image(systemName: "questionmark.circle") }
+                        .help("利用手順を開く")
+                        .accessibilityLabel("利用手順を開く")
+                    SettingsLink { Image(systemName: "gearshape") }
+                        .accessibilityLabel("設定を開く")
                 }
-            }
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Circle()
+                                .fill(model.isRecording ? Color.red : Color.accentColor)
+                                .frame(width: 9, height: 9)
+                            Text(model.statusLabel).font(.headline)
+                            Spacer()
+                            if model.isStarting || model.isStopping || model.isProcessing {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text(model.elapsedDescription)
+                                .font(.title2.monospacedDigit())
+                        }
+                        if model.isRecording {
+                            ForEach(model.inputLevels.keys.sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { track in
+                                if let snapshot = model.inputLevels[track] {
+                                    AudioInputMeterView(track: track, snapshot: snapshot)
+                                }
+                            }
+                            HStack {
+                                Text("自動停止まで \(model.remainingDescription)").monospacedDigit()
+                                Spacer()
+                                Button("15分延長") { model.extendRecording() }
+                            }
+                            if let warning = model.limitWarning {
+                                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        Text(model.message)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if model.isRecording || model.isStopping || model.isProcessing {
+                            Button(model.isProcessing ? "後処理中…" : (model.isStopping ? "音声を保存中…" : "録音を停止して保存")) {
+                                model.stopRecording()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .disabled(model.isStopping || model.isProcessing)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                }
+
+                GroupBox("次の録音") {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(spacing: 20) {
+                            Picker("認識言語", selection: $model.languageMode) {
+                                Text("日本語").tag(LanguageMode.japanese)
+                                Text("日本語＋英語").tag(LanguageMode.japaneseAndEnglish)
+                            }
+                            Stepper("自動停止: \(model.recordingLimitMinutes)分", value: $model.recordingLimitMinutes, in: 5...720, step: 5)
+                        }
+                        .disabled(!model.canStart)
+                        HStack(alignment: .top, spacing: 16) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("オンライン会議", systemImage: "video")
+                                    .font(.headline)
+                                Text("相手の音声と自分のマイクを記録")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Menu("会議ウインドウを選ぶ") {
+                                    ForEach(model.meetWindows) { window in
+                                        Button(window.label) { model.beginMeet(window: window) }
+                                    }
+                                    if !model.meetWindows.isEmpty { Divider() }
+                                    Button("会議ウインドウを読み込む…") { model.refreshMeetWindows() }
+                                }
+                                .accessibilityLabel("オンライン会議を録音")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Divider()
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("対面授業・会話", systemImage: "mic")
+                                    .font(.headline)
+                                Text("選んだマイクの音声を記録")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Menu("マイクを選んで録音") {
+                                    Button("標準マイク") { model.beginClassroom(microphoneID: nil) }
+                                    ForEach(model.microphones) { microphone in
+                                        Button(microphone.name) { model.beginClassroom(microphoneID: microphone.id) }
+                                    }
+                                    Divider()
+                                    Button("マイク一覧を更新") { model.refreshMicrophones() }
+                                }
+                                .accessibilityLabel("対面授業を録音")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                        .disabled(!model.canStart)
+                        Text("停止5分前・1分前に通知します。録音中は15分ずつ延長できます。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(6)
+                }
+
+                GroupBox("直近の録音") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if let url = model.lastWorkspaceURL {
+                            Text(url.lastPathComponent)
+                                .font(.headline).textSelection(.enabled)
+                            HStack {
+                                Button { model.openTranscript() } label: {
+                                    Label("文字起こし全文", systemImage: "text.alignleft")
+                                }
+                                .disabled(!model.canOpenTranscript)
+                                Button("Finderで表示") { model.revealLastWorkspace() }
+                            }
+                            Text("全文はMarkdown形式。発話時刻・話者・認識の信頼度を確認できます。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("録音が完了すると、ここから話者付きの全文を開けます。")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                }
+
+                if model.recoveryCount > 0 {
+                    GroupBox {
+                        HStack {
+                            Label("未完了の録音が\(model.recoveryCount)件あります", systemImage: "arrow.clockwise")
+                            Spacer()
+                            Button("後処理を再開") { model.resumePostProcessing() }
+                                .disabled(!model.canStart)
+                        }
+                        .padding(6)
+                    }
+                }
+
+                DisclosureGroup("保存先") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(model.saveDirectoryURL.path)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        HStack {
+                            Button("Finderで開く") { model.openSaveDirectory() }
+                                .accessibilityLabel("保存先をFinderで開く")
+                            Button("変更…") { model.chooseSaveDirectory() }
+                                .accessibilityLabel("保存先を変更")
+                                .disabled(!model.canStart)
+                        }
+                    }
+                    .padding(.top, 8)
+                }
             }
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 560, minHeight: 500)
+        .frame(minWidth: 650, minHeight: 600)
     }
 }
 
@@ -802,14 +977,19 @@ private struct SettingsView: View {
 
     private func permissionText(_ state: CapturePermissionState) -> String {
         switch state {
-        case .notDetermined: "未確認"
+        case .notDetermined: "未申請"
         case .authorized: "許可済み"
-        case .denied: "未許可"
+        case .denied: "拒否済み"
+        case .restricted: "端末の管理により制限"
+        case .unconfirmed: "許可を確認できません"
         }
     }
 
     var body: some View {
         Form {
+            Section {
+                Button("利用手順を開く") { model.openUsageGuide() }
+            }
             Section("保存先") {
                 Text(model.saveDirectoryURL.path)
                     .font(.caption)
@@ -833,58 +1013,62 @@ private struct SettingsView: View {
                 Text("変更は次回の録音から適用され、既存の録音は移動しません。")
                     .foregroundStyle(.secondary)
             }
-            Section("録音") {
-            Picker("言語", selection: $model.languageMode) {
-                Text("日本語").tag(LanguageMode.japanese)
-                Text("日本語＋英語").tag(LanguageMode.japaneseAndEnglish)
-            }
-            LabeledContent(
-                "マイク権限",
-                value: permissionText(model.permissionSnapshot.microphone)
-            )
-            LabeledContent(
-                "画面収録権限",
-                value: permissionText(model.permissionSnapshot.screenRecording)
-            )
-            HStack {
-                Button("権限を再確認") {
-                    model.recheckPermissions()
+            Section("認識と録音時間") {
+                Picker("言語", selection: $model.languageMode) {
+                    Text("日本語").tag(LanguageMode.japanese)
+                    Text("日本語＋英語").tag(LanguageMode.japaneseAndEnglish)
                 }
-                Button("マイク設定") {
-                    model.openMicrophonePrivacySettings()
-                }
-                Button("画面収録設定") {
-                    model.openScreenRecordingPrivacySettings()
-                }
-                Button("音声認識設定") {
-                    model.openSpeechRecognitionPrivacySettings()
-                }
-                Button("音声入力設定") {
-                    model.openDictationSettings()
-                }
-            }
-            if #available(macOS 26.0, *) {
-                Text("長時間会話向けの高精度オンデバイス認識を使用します。初回のみAppleの言語モデル取得が必要な場合があります。モデルを利用できない場合は従来方式へ切り替えるため、『音声入力』もオンにしてください。")
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("文字起こしには、音声認識権限に加えて、キーボード設定の『音声入力』をオンにする必要があります。")
+                .disabled(!model.canStart)
+                Stepper("自動停止: \(model.recordingLimitMinutes)分", value: $model.recordingLimitMinutes, in: 5...720, step: 5)
+                    .disabled(!model.canStart)
+                Text("停止5分前・1分前に通知します。録音中は15分延長できます。音声入力が続いていても上限で停止します。")
                     .foregroundStyle(.secondary)
             }
-            if model.permissionSnapshot.screenRecording == .denied {
-                Text("画面収録設定の変更は、Recall Captureを完全終了して起動し直すまで反映されません。再起動後も未許可なら、設定を一度オフ→オンにしてもう一度再起動してください。")
-                    .foregroundStyle(.orange)
-            }
-            if model.usesAdHocSigning {
-                Text("このアプリは開発用の一時署名です。再ビルド後は画面収録を再許可する必要があります。継続利用には同じApple Development証明書でビルドしてください。")
+            Section("権限とデータ") {
+                LabeledContent("マイク", value: permissionText(model.permissionSnapshot.microphone))
+                Text("会議での自分の声・対面授業の音声を録音します。両モードで必要です。")
                     .foregroundStyle(.secondary)
-            }
-            Text("外部AI: 使用しない（既定）")
-            Text("音声は60秒チャンクで一時保存し、3時間で自動停止します。")
-                .foregroundStyle(.secondary)
+                LabeledContent("画面収録", value: permissionText(model.permissionSnapshot.screenRecording))
+                Text("オンライン会議のPC音声に必要です。映像は保存しません。対面録音では要求しません。未申請と拒否はmacOSのAPIでは区別できません。")
+                    .foregroundStyle(.secondary)
+                LabeledContent("音声認識", value: permissionText(model.permissionSnapshot.speechRecognition))
+                Text("録音を文字へ変換するために必要です。開始前に確認し、音声は端末内で処理します。")
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("権限を再確認") { model.recheckPermissions() }
+                    Button("マイク設定") { model.openMicrophonePrivacySettings() }
+                    Button("画面収録設定") { model.openScreenRecordingPrivacySettings() }
+                }
+                HStack {
+                    Button("音声認識設定") { model.openSpeechRecognitionPrivacySettings() }
+                    Button("音声入力設定") { model.openDictationSettings() }
+                }
+                Text("通知は停止予告に使います（任意）。許可がなくても録音できます。管理者権限・アカウント・APIキーは不要です。")
+                    .foregroundStyle(.secondary)
+                if #available(macOS 26.0, *) {
+                    Text("SpeechAnalyzerによるオンデバイス認識を使用します。初回のみAppleの言語モデル取得が必要な場合があります。モデルを利用できない場合は従来方式へ切り替えるため、『音声入力』もオンにしてください。")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("文字起こしには、音声認識権限に加えて、キーボード設定の『音声入力』をオンにする必要があります。")
+                        .foregroundStyle(.secondary)
+                }
+                if model.permissionSnapshot.screenRecording == .unconfirmed {
+                    Text("システム設定で許可後も状態が変わらない場合は、Recall Captureを完全終了して起動し直してください。")
+                        .foregroundStyle(.orange)
+                }
+                if model.usesAdHocSigning {
+                    Text("このアプリは開発用の一時署名です。再ビルド後は画面収録を再許可する必要があります。継続利用には同じ署名証明書でビルドしてください。")
+                        .foregroundStyle(.secondary)
+                }
+                Text("Apple Intelligenceは不要です。外部AIサービスへの送信はありません。")
+                Text("保存先がiCloudなどの場合、保存後の同期はそのサービスの設定に従います。")
+                    .foregroundStyle(.secondary)
+                Text("音声は60秒ごとに保存します。初期設定は120分で自動停止です。")
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(20)
-        .frame(width: 540)
+        .formStyle(.grouped)
+        .frame(width: 620, height: 680)
         .onAppear {
             model.refreshPermissions()
         }

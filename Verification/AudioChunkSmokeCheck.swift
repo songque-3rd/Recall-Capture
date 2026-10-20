@@ -65,6 +65,50 @@ enum AudioChunkSmokeCheck {
             throw AudioChunkSmokeError.partialFileRemained(files)
         }
 
+        // A missing span must not shift all later words and speaker boundaries.
+        let gapPaths = RecordingWorkspacePaths(root: root, sessionID: UUID())
+        try gapPaths.createDirectories(tracks: [.microphone])
+        let gapWriter = ChunkedAudioWriter(paths: gapPaths, track: .microphone, chunkDurationSeconds: 60)
+        let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000)!
+        silence.frameLength = 48_000
+        silence.floatChannelData![0].initialize(repeating: 0, count: 48_000)
+        guard try gapWriter.append(silence, sessionTimestampMilliseconds: 0) == nil,
+              let first = try gapWriter.append(silence, sessionTimestampMilliseconds: 10_000),
+              let second = try gapWriter.finish(),
+              first.startedAtMilliseconds == 0, first.durationMilliseconds == 1_000,
+              second.startedAtMilliseconds == 10_000, second.durationMilliseconds == 1_000,
+              !AudioInputMeter.measure(silence).hasSound else {
+            throw AudioChunkSmokeError.invalidMeterOrTiming
+        }
+        // Verify both planar and interleaved stereo, with sound only on channel 2.
+        for common: AVAudioCommonFormat in [.pcmFormatFloat32, .pcmFormatFloat64, .pcmFormatInt16, .pcmFormatInt32] {
+            for interleaved in [false, true] {
+                let stereo = AVAudioFormat(commonFormat: common, sampleRate: 48_000,
+                                           channels: 2, interleaved: interleaved)!
+                let buffer = AVAudioPCMBuffer(pcmFormat: stereo, frameCapacity: 4)!
+                buffer.frameLength = 4
+                let list = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+                for channel in 0..<2 {
+                    for frame in 0..<4 {
+                        let data = list[interleaved ? 0 : channel].mData!
+                        let index = frame * Int(buffer.stride) + (interleaved ? channel : 0)
+                        switch common {
+                        case .pcmFormatFloat32: data.assumingMemoryBound(to: Float.self)[index] = channel == 0 ? 0 : 0.5
+                        case .pcmFormatFloat64: data.assumingMemoryBound(to: Double.self)[index] = channel == 0 ? 0 : 0.5
+                        case .pcmFormatInt16: data.assumingMemoryBound(to: Int16.self)[index] = channel == 0 ? 0 : 16_384
+                        case .pcmFormatInt32: data.assumingMemoryBound(to: Int32.self)[index] = channel == 0 ? 0 : 1_073_741_824
+                        default: break
+                        }
+                    }
+                }
+                let measured = AudioInputMeter.measure(buffer)
+                guard abs(measured.rms - sqrt(0.125)) < 0.0001,
+                      measured.peak == 0.5, measured.hasSound else {
+                    throw AudioChunkSmokeError.invalidMeterOrTiming
+                }
+            }
+        }
+
         print("audio-chunk-smoke-check: passed")
         print(paths.directory.path)
     }
@@ -76,4 +120,5 @@ enum AudioChunkSmokeError: Error {
     case cannotAllocateBuffer
     case invalidChunks([AudioChunkDescriptor])
     case partialFileRemained([URL])
+    case invalidMeterOrTiming
 }

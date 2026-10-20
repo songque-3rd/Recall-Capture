@@ -2,6 +2,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import CaptureCore
 
 enum SpeechRecognitionEngineError: LocalizedError {
     case permissionDenied
@@ -39,15 +40,19 @@ struct RecognizedSegment: Sendable {
     let text: String
     let startSeconds: TimeInterval
     let durationSeconds: TimeInterval
-    let confidence: Double
+    let confidence: Double?
 }
 
 final class SpeechRecognitionEngine: @unchecked Sendable {
     func authorize() async throws {
-        let status = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
+        let current = SFSpeechRecognizer.authorizationStatus()
+        let status: SFSpeechRecognizerAuthorizationStatus
+        if current == .notDetermined {
+            status = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
             }
+        } else {
+            status = current
         }
         switch status {
         case .authorized:
@@ -101,7 +106,9 @@ final class SpeechRecognitionEngine: @unchecked Sendable {
     ) async throws -> [RecognizedSegment] {
         // The transcription preset requests the complete, highest-quality
         // result without lower-accuracy volatile or fast output.
-        let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+        var preset = SpeechTranscriber.Preset.transcription
+        preset.attributeOptions = [.audioTimeRange, .transcriptionConfidence]
+        let transcriber = SpeechTranscriber(locale: locale, preset: preset)
         try await installAssetsIfNeeded(for: transcriber, locale: locale)
 
         let audioFile: AVAudioFile
@@ -184,15 +191,35 @@ final class SpeechRecognitionEngine: @unchecked Sendable {
             let text = String(result.text.characters)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            let confidences = result.text.runs.compactMap(\.transcriptionConfidence)
-            let confidence = confidences.isEmpty
-                ? 0.5
-                : confidences.reduce(0, +) / Double(confidences.count)
+            let runs = result.text.runs.filter {
+                !String(result.text[$0.range].characters).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            // Word-level timing keeps a long result from being assigned to one speaker.
+            if !runs.isEmpty, runs.allSatisfy({
+                guard let range = $0.audioTimeRange else { return false }
+                return CMTimeGetSeconds(range.start).isFinite && CMTimeGetSeconds(range.duration).isFinite
+            }) {
+                for run in runs {
+                    guard let range = run.audioTimeRange else { continue }
+                    output.append(RecognizedSegment(
+                        text: String(result.text[run.range].characters),
+                        startSeconds: max(0, CMTimeGetSeconds(range.start)),
+                        durationSeconds: max(0, CMTimeGetSeconds(range.duration)),
+                        confidence: TranscriptText.confidence([run.transcriptionConfidence])
+                    ))
+                }
+                continue
+            }
+            let start = CMTimeGetSeconds(result.range.start)
+            let duration = CMTimeGetSeconds(result.range.duration)
+            guard start.isFinite, duration.isFinite else {
+                throw SpeechRecognitionEngineError.recognitionFailed("発話の時刻情報を読み取れませんでした。")
+            }
             output.append(RecognizedSegment(
                 text: text,
-                startSeconds: max(0, CMTimeGetSeconds(result.range.start)),
-                durationSeconds: max(0, CMTimeGetSeconds(result.range.duration)),
-                confidence: min(1, max(0, confidence))
+                startSeconds: max(0, start),
+                durationSeconds: max(0, duration),
+                confidence: TranscriptText.confidence(runs.map(\.transcriptionConfidence))
             ))
         }
         return output

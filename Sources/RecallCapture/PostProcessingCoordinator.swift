@@ -20,7 +20,7 @@ enum PostProcessingError: LocalizedError {
         case .noSpeechDetected:
             "音声から発話を検出できませんでした。音声ファイルは再処理用に残しています。"
         case .incompleteArtifacts:
-            "文字起こしJSONLと要約PDFの両方を確定できませんでした。"
+            "文字起こし全文とJSONLを確定できませんでした。"
         }
     }
 }
@@ -28,7 +28,8 @@ enum PostProcessingError: LocalizedError {
 struct PostProcessingResult: Sendable {
     let workspace: RecordingWorkspacePaths
     let transcriptURL: URL
-    let summaryPDFURL: URL
+    let transcriptMarkdownURL: URL
+    let warnings: [String]
     let utteranceCount: Int
 }
 
@@ -38,9 +39,9 @@ final class PostProcessingCoordinator: @unchecked Sendable {
     private let fileManager: FileManager
     private let manifestStore = RecordingManifestStore()
     private let transcriptWriter = TranscriptJSONLWriter()
-    private let summaryBuilder = LocalSummaryBuilder()
-    private let pdfWriter = SummaryPDFWriter()
+    private let markdownWriter = TranscriptMarkdownWriter()
     private let recognitionEngine = SpeechRecognitionEngine()
+    private let diarizationEngine = SpeakerDiarizationEngine()
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -64,24 +65,6 @@ final class PostProcessingCoordinator: @unchecked Sendable {
             manifest.setStatus(.processing)
             try manifestStore.save(manifest, to: workspace.manifestURL)
 
-            await progress(.detectingSpeech)
-            try await recognitionEngine.authorize()
-            let locales = recognitionLocales(for: manifest.languageMode)
-
-            await progress(.transcribing)
-            let recognized = try await transcribe(
-                manifest: manifest,
-                workspace: workspace,
-                locales: locales
-            )
-            guard !recognized.isEmpty else {
-                throw PostProcessingError.noSpeechDetected
-            }
-
-            await progress(.diarizing)
-            let utterances = makeUtterances(from: recognized, captureMode: manifest.captureMode)
-
-            await progress(.formatting)
             guard let sessionID = UUID(uuidString: manifest.sessionID),
                   let startedAt = Self.date(from: manifest.startedAt) else {
                 throw PostProcessingError.invalidManifest
@@ -89,41 +72,64 @@ final class PostProcessingCoordinator: @unchecked Sendable {
             let durationMilliseconds = manifest.chunks.map {
                 $0.startedAtMilliseconds + $0.durationMilliseconds
             }.max() ?? 0
-            let metadata = SessionMetadata(
-                sessionID: sessionID,
-                title: manifest.title,
-                startedAt: startedAt,
+            let expectedMetadata = SessionMetadata(
+                sessionID: sessionID, title: manifest.title, startedAt: startedAt,
                 endedAt: startedAt.addingTimeInterval(Double(durationMilliseconds) / 1_000),
-                captureMode: manifest.captureMode,
-                languageMode: manifest.languageMode,
-                timezone: .current,
-                appVersion: appVersion
+                captureMode: manifest.captureMode, languageMode: manifest.languageMode,
+                timezone: .current, appVersion: appVersion
             )
+            let transcriptURL = SessionLocation(directory: workspace.directory).transcriptJSONL
+            let cached = fileManager.fileExists(atPath: transcriptURL.path)
+                ? try transcriptWriter.read(from: transcriptURL, matching: expectedMetadata) : nil
+            let metadata: SessionMetadata
+            let utterances: [UtteranceRecord]
+            let warnings: [String]
+            await progress(.detectingSpeech)
+            if let cached {
+                // The log is canonical. Repairing derived Markdown must preserve recognition.
+                await progress(.transcribing)
+                await progress(.diarizing)
+                metadata = cached.metadata
+                utterances = cached.utterances
+                let notes = workspace.directory.appendingPathComponent("transcript-notes.txt")
+                warnings = (try? String(contentsOf: notes, encoding: .utf8))?
+                    .split(separator: "\n").map(String.init) ?? []
+            } else {
+                try await recognitionEngine.authorize()
+                await progress(.transcribing)
+                let recognized = try await transcribe(
+                    manifest: manifest, workspace: workspace,
+                    locales: recognitionLocales(for: manifest.languageMode)
+                )
+                guard !recognized.isEmpty else { throw PostProcessingError.noSpeechDetected }
+                await progress(.diarizing)
+                let diarization = await diarizationEngine.diarize(manifest: manifest, workspace: workspace)
+                metadata = expectedMetadata
+                utterances = makeUtterances(from: recognized, captureMode: manifest.captureMode,
+                    timelines: diarization.timelines)
+                warnings = diarization.warnings
+            }
 
-            await progress(.summarizingChunks)
-            let summary = summaryBuilder.build(metadata: metadata, utterances: utterances)
-            await progress(.summarizingOverall)
-
+            await progress(.formatting)
             await progress(.writingArtifacts)
-            let artifacts = try writeArtifactPair(
-                workspace: workspace,
-                metadata: metadata,
-                utterances: utterances,
-                summary: summary
-            )
-
+            try writeTranscriptArtifacts(workspace: workspace, metadata: metadata, utterances: utterances)
+            let location = SessionLocation(directory: workspace.directory)
             await progress(.validatingArtifacts)
-            try validateArtifactPair(
-                transcriptURL: artifacts.transcript,
-                summaryPDFURL: artifacts.pdf
-            )
+            let saved = try transcriptWriter.read(from: location.transcriptJSONL, matching: metadata)
+            guard !saved.utterances.isEmpty else { throw PostProcessingError.incompleteArtifacts }
+            try markdownWriter.validate(location.transcriptMarkdown, metadata: saved.metadata, utterances: saved.utterances)
+            // Keep processing limitations next to the transcript for later review.
+            let notes = workspace.directory.appendingPathComponent("transcript-notes.txt")
+            try (warnings.isEmpty ? "" : warnings.joined(separator: "\n") + "\n")
+                .write(to: notes, atomically: true, encoding: .utf8)
 
             manifest.setStatus(.completed)
             try manifestStore.save(manifest, to: workspace.manifestURL)
             return PostProcessingResult(
                 workspace: workspace,
-                transcriptURL: artifacts.transcript,
-                summaryPDFURL: artifacts.pdf,
+                transcriptURL: location.transcriptJSONL,
+                transcriptMarkdownURL: location.transcriptMarkdown,
+                warnings: warnings,
                 utteranceCount: utterances.count
             )
         } catch {
@@ -142,8 +148,8 @@ final class PostProcessingCoordinator: @unchecked Sendable {
         manifest: RecordingManifest,
         workspace: RecordingWorkspacePaths,
         locales: [Locale]
-    ) async throws -> [RecognizedSpan] {
-        var result: [RecognizedSpan] = []
+    ) async throws -> [TimedTranscriptSegment] {
+        var result: [TimedTranscriptSegment] = []
         var recentContextByTrack: [String: [String]] = [:]
         let chunks = manifest.chunks.sorted {
             if $0.startedAtMilliseconds == $1.startedAtMilliseconds {
@@ -174,21 +180,25 @@ final class PostProcessingCoordinator: @unchecked Sendable {
                     firstFailure = firstFailure ?? error
                 }
             }
-            guard let best = candidates.max(by: { recognitionScore($0) < recognitionScore($1) }) else {
+            guard let best = candidates.filter({ !$0.segments.isEmpty }).max(by: { recognitionScore($0) < recognitionScore($1) }) else {
                 if let firstFailure { throw firstFailure }
                 continue
             }
-            let contextText = best.segments.map(\.text).joined(separator: " ")
+            let contextText = TranscriptText.join(best.segments.map(\.text))
             if !contextText.isEmpty {
                 var context = recentContextByTrack[trackKey] ?? []
                 context.append(String(contextText.suffix(600)))
                 recentContextByTrack[trackKey] = Array(context.suffix(3))
             }
-            result.append(contentsOf: group(
-                best.segments,
-                chunkOffsetMilliseconds: chunk.startedAtMilliseconds,
-                track: chunk.track
-            ))
+            result.append(contentsOf: best.segments.map { segment in
+                TimedTranscriptSegment(
+                    startMilliseconds: chunk.startedAtMilliseconds + Int64(segment.startSeconds * 1_000),
+                    endMilliseconds: chunk.startedAtMilliseconds + Int64((segment.startSeconds + segment.durationSeconds) * 1_000),
+                    track: chunk.track,
+                    language: best.locale.identifier.hasPrefix("ja") ? "ja" : "en",
+                    text: segment.text, confidence: segment.confidence
+                )
+            })
         }
         return result.sorted {
             if $0.startMilliseconds == $1.startMilliseconds {
@@ -200,9 +210,8 @@ final class PostProcessingCoordinator: @unchecked Sendable {
 
     private func recognitionScore(_ candidate: RecognitionCandidate) -> Double {
         guard !candidate.segments.isEmpty else { return -.infinity }
-        let confidence = candidate.segments.map(\.confidence).reduce(0, +)
-            / Double(candidate.segments.count)
-        let text = candidate.segments.map(\.text).joined(separator: " ")
+        let confidence = TranscriptText.confidence(candidate.segments.map(\.confidence)) ?? 0.5
+        let text = TranscriptText.join(candidate.segments.map(\.text))
         let boundedLengthBonus = Double(min(text.count, 100)) * 0.08
         let detectedLanguage = Self.language(of: text)
         let expectedLanguage = candidate.locale.identifier.hasPrefix("ja") ? "ja" : "en"
@@ -212,153 +221,30 @@ final class PostProcessingCoordinator: @unchecked Sendable {
         return confidence * 100 + boundedLengthBonus + languageBonus
     }
 
-    private func group(
-        _ segments: [RecognizedSegment],
-        chunkOffsetMilliseconds: Int64,
-        track: AudioTrack
-    ) -> [RecognizedSpan] {
-        var output: [RecognizedSpan] = []
-        var current: [RecognizedSegment] = []
-
-        func flush() {
-            guard let first = current.first, let last = current.last else { return }
-            let text = current.map(\.text).joined(separator: " ")
-                .replacingOccurrences(of: "  ", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else {
-                current.removeAll(keepingCapacity: true)
-                return
-            }
-            output.append(RecognizedSpan(
-                startMilliseconds: chunkOffsetMilliseconds + Int64(first.startSeconds * 1_000),
-                endMilliseconds: chunkOffsetMilliseconds + Int64((last.startSeconds + last.durationSeconds) * 1_000),
-                track: track,
-                language: Self.language(of: text),
-                text: text,
-                confidence: current.map(\.confidence).reduce(0, +) / Double(current.count)
-            ))
-            current.removeAll(keepingCapacity: true)
-        }
-
-        for segment in segments {
-            if let prior = current.last {
-                let gap = segment.startSeconds - (prior.startSeconds + prior.durationSeconds)
-                let elapsed = segment.startSeconds - (current.first?.startSeconds ?? segment.startSeconds)
-                if gap > 1.2 || elapsed > 15 {
-                    flush()
-                }
-            }
-            current.append(segment)
-            if segment.text.last.map({ "。！？.!?".contains($0) }) == true {
-                flush()
-            }
-        }
-        flush()
-        return output
-    }
-
     private func makeUtterances(
-        from spans: [RecognizedSpan],
-        captureMode: CaptureMode
+        from spans: [TimedTranscriptSegment],
+        captureMode: CaptureMode,
+        timelines: [AudioTrack: SpeakerTimeline]
     ) -> [UtteranceRecord] {
-        spans.enumerated().map { offset, span in
-            let speaker: String
-            if captureMode == .classroom {
-                speaker = "unknown"
-            } else {
-                speaker = span.track == .microphone ? "self" : "speaker_01"
-            }
-            return UtteranceRecord(
-                index: offset + 1,
-                startMilliseconds: span.startMilliseconds,
-                endMilliseconds: max(span.startMilliseconds, span.endMilliseconds),
-                speaker: speaker,
-                track: span.track,
-                language: span.language,
-                text: span.text,
-                confidence: min(1, max(0, span.confidence))
-            )
-        }
+        TranscriptAssembler().assemble(segments: spans, captureMode: captureMode, timelines: timelines)
     }
 
-    private func writeArtifactPair(
-        workspace: RecordingWorkspacePaths,
-        metadata: SessionMetadata,
-        utterances: [UtteranceRecord],
-        summary: SessionSummary
-    ) throws -> (transcript: URL, pdf: URL) {
-        let location = SessionLocation(directory: workspace.directory)
-        let staging = workspace.directory.appendingPathComponent(
-            ".postprocessing-\(UUID().uuidString)",
-            isDirectory: true
-        )
+    private func writeTranscriptArtifacts(
+        workspace: RecordingWorkspacePaths, metadata: SessionMetadata, utterances: [UtteranceRecord]
+    ) throws {
+        let staging = workspace.directory.appendingPathComponent(".transcript-save-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: false)
         defer { try? fileManager.removeItem(at: staging) }
-
-        let stagedTranscript = staging.appendingPathComponent("transcript.jsonl")
-        let stagedPDF = staging.appendingPathComponent("summary.pdf")
-        try transcriptWriter.write(metadata: metadata, utterances: utterances, to: stagedTranscript)
-        try pdfWriter.write(summary: summary, metadata: metadata, to: stagedPDF)
-        try validateArtifactPair(transcriptURL: stagedTranscript, summaryPDFURL: stagedPDF)
-
-        try replacePair(
-            stagedTranscript: stagedTranscript,
-            stagedPDF: stagedPDF,
-            destinationTranscript: location.transcriptJSONL,
-            destinationPDF: location.summaryPDF
-        )
-        return (location.transcriptJSONL, location.summaryPDF)
-    }
-
-    private func replacePair(
-        stagedTranscript: URL,
-        stagedPDF: URL,
-        destinationTranscript: URL,
-        destinationPDF: URL
-    ) throws {
-        let backupTranscript = destinationTranscript.appendingPathExtension("backup")
-        let backupPDF = destinationPDF.appendingPathExtension("backup")
-        try? fileManager.removeItem(at: backupTranscript)
-        try? fileManager.removeItem(at: backupPDF)
-
-        if fileManager.fileExists(atPath: destinationTranscript.path) {
-            try fileManager.moveItem(at: destinationTranscript, to: backupTranscript)
+        let json = staging.appendingPathComponent("transcript.jsonl")
+        let markdown = staging.appendingPathComponent("transcript.md")
+        try transcriptWriter.write(metadata: metadata, utterances: utterances, to: json)
+        try markdownWriter.write(metadata: metadata, utterances: utterances, to: markdown)
+        let location = SessionLocation(directory: workspace.directory)
+        try ArtifactTransaction(fileManager: fileManager).commit(staged: [json, markdown], to: workspace.directory) {
+            let saved = try self.transcriptWriter.read(from: location.transcriptJSONL, matching: metadata)
+            guard saved.utterances == utterances else { throw PostProcessingError.incompleteArtifacts }
+            try self.markdownWriter.validate(location.transcriptMarkdown, metadata: saved.metadata, utterances: saved.utterances)
         }
-        if fileManager.fileExists(atPath: destinationPDF.path) {
-            try fileManager.moveItem(at: destinationPDF, to: backupPDF)
-        }
-
-        do {
-            try fileManager.moveItem(at: stagedTranscript, to: destinationTranscript)
-            try fileManager.moveItem(at: stagedPDF, to: destinationPDF)
-            try validateArtifactPair(
-                transcriptURL: destinationTranscript,
-                summaryPDFURL: destinationPDF
-            )
-            try? fileManager.removeItem(at: backupTranscript)
-            try? fileManager.removeItem(at: backupPDF)
-        } catch {
-            try? fileManager.removeItem(at: destinationTranscript)
-            try? fileManager.removeItem(at: destinationPDF)
-            if fileManager.fileExists(atPath: backupTranscript.path) {
-                try? fileManager.moveItem(at: backupTranscript, to: destinationTranscript)
-            }
-            if fileManager.fileExists(atPath: backupPDF.path) {
-                try? fileManager.moveItem(at: backupPDF, to: destinationPDF)
-            }
-            throw error
-        }
-    }
-
-    private func validateArtifactPair(transcriptURL: URL, summaryPDFURL: URL) throws {
-        guard fileManager.fileExists(atPath: transcriptURL.path),
-              fileManager.fileExists(atPath: summaryPDFURL.path),
-              let transcriptData = try? Data(contentsOf: transcriptURL),
-              !transcriptData.isEmpty,
-              !transcriptData.split(separator: 0x0A).isEmpty else {
-            throw PostProcessingError.incompleteArtifacts
-        }
-        try pdfWriter.validate(summaryPDFURL, fileManager: fileManager)
     }
 
     private static func language(of text: String) -> String {
@@ -381,13 +267,4 @@ final class PostProcessingCoordinator: @unchecked Sendable {
 private struct RecognitionCandidate: Sendable {
     let locale: Locale
     let segments: [RecognizedSegment]
-}
-
-private struct RecognizedSpan: Sendable {
-    let startMilliseconds: Int64
-    let endMilliseconds: Int64
-    let track: AudioTrack
-    let language: String
-    let text: String
-    let confidence: Double
 }

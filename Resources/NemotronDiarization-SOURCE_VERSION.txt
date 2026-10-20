@@ -1,0 +1,4 @@
+NeMo-Speech.cpp commit 0f706e43cf1fbc031bad1423e05460d3acaeaa1c
+CMake preset cpu-diar
+SentencePiece commit 17d7580d6407802f85855d2cc9190634e2c95624 (static)
+Nemotron-3-Diarization revision f667ed73aee57d40cc39428eb768b4fd87a0a29e

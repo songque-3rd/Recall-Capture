@@ -21,7 +21,6 @@ final class RecordingCoordinator: @unchecked Sendable {
     typealias FailureHandler = @Sendable (String) -> Void
 
     static let chunkDurationSeconds = 60
-    static let maximumDurationSeconds = 10_800
 
     private let captureQueue = DispatchQueue(label: "jp.recallcapture.audio-samples")
     private let controlQueue = DispatchQueue(label: "jp.recallcapture.capture-control")
@@ -36,6 +35,8 @@ final class RecordingCoordinator: @unchecked Sendable {
     private var workspace: RecordingWorkspacePaths?
     private var manifest: RecordingManifest?
     private var writers: [AudioTrack: ChunkedAudioWriter] = [:]
+    private var configuredMaximumSeconds = RecordingLimit.defaultSeconds
+    private var inputLevels: [AudioTrack: AudioInputSnapshot] = [:]
     private var timelineOriginSeconds: Double?
     private var acceptsSamples = false
     private var didReportFailure = false
@@ -220,6 +221,22 @@ final class RecordingCoordinator: @unchecked Sendable {
         }
     }
 
+    func audioInputSnapshot() -> [AudioTrack: AudioInputSnapshot] {
+        captureQueue.sync { inputLevels }
+    }
+
+    func setMaximumDuration(seconds: Int) throws {
+        try captureQueue.sync {
+            let bounded = min(RecordingLimit.maximumSeconds, max(60, seconds))
+            if var updated = manifest, let workspace {
+                updated.setMaximumDuration(seconds: bounded)
+                try manifestStore.save(updated, to: workspace.manifestURL)
+                manifest = updated
+            }
+            configuredMaximumSeconds = bounded
+        }
+    }
+
     private func prepare(
         title: String,
         mode: CaptureMode,
@@ -246,7 +263,7 @@ final class RecordingCoordinator: @unchecked Sendable {
                 startedAt: startedAt,
                 tracks: tracks,
                 chunkDurationSeconds: Self.chunkDurationSeconds,
-                maximumDurationSeconds: Self.maximumDurationSeconds
+                maximumDurationSeconds: configuredMaximumSeconds
             )
             try manifestStore.save(newManifest, to: paths.manifestURL)
             workspace = paths
@@ -257,6 +274,9 @@ final class RecordingCoordinator: @unchecked Sendable {
                     track: track,
                     chunkDurationSeconds: Self.chunkDurationSeconds
                 ))
+            })
+            inputLevels = Dictionary(uniqueKeysWithValues: tracks.map {
+                ($0, AudioInputSnapshot(level: .init(rms: 0, peak: 0), receivedAt: .distantPast, lastSoundAt: nil))
             })
             timelineOriginSeconds = nil
             didReportFailure = false
@@ -270,6 +290,10 @@ final class RecordingCoordinator: @unchecked Sendable {
         guard acceptsSamples, let writer = writers[track] else { return }
         do {
             let buffer = try SampleBufferAudioConverter.pcmBuffer(from: sampleBuffer)
+            let level = AudioInputMeter.measure(buffer)
+            let receivedAt = Date.now
+            inputLevels[track] = .init(level: level, receivedAt: receivedAt,
+                lastSoundAt: level.hasSound ? receivedAt : inputLevels[track]?.lastSoundAt)
             let presentationSeconds = SampleBufferAudioConverter.presentationSeconds(of: sampleBuffer)
             if timelineOriginSeconds == nil {
                 timelineOriginSeconds = presentationSeconds
@@ -311,6 +335,7 @@ final class RecordingCoordinator: @unchecked Sendable {
         workspace = nil
         manifest = nil
         writers = [:]
+        inputLevels = [:]
         timelineOriginSeconds = nil
         acceptsSamples = false
         didReportFailure = false

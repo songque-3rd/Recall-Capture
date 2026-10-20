@@ -9,6 +9,7 @@ public enum TranscriptValidationError: Error, Equatable, LocalizedError {
     case invalidConfidence(index: Int)
     case destinationAlreadyExists
     case unreadableJSONLine(Int)
+    case sessionMismatch
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum TranscriptValidationError: Error, Equatable, LocalizedError {
             "transcript.jsonl はすでに存在します。"
         case let .unreadableJSONLine(line):
             "JSONL の \(line) 行目を検証できません。"
+        case .sessionMismatch:
+            "保存済みの文字起こしが録音情報と一致しません。元のファイルを保持しました。"
         }
     }
 }
@@ -87,6 +90,44 @@ public struct TranscriptJSONLWriter {
         }
     }
 
+    public func read(from url: URL) throws -> (metadata: SessionMetadata, utterances: [UtteranceRecord]) {
+        let lines = try Data(contentsOf: url).split(separator: 0x0A)
+        guard let first = lines.first else { throw TranscriptValidationError.unreadableJSONLine(1) }
+        let decoder = JSONDecoder()
+        func requireType(_ line: Data, _ type: String, _ number: Int) throws {
+            guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  object["type"] as? String == type else {
+                throw TranscriptValidationError.unreadableJSONLine(number)
+            }
+        }
+        try requireType(Data(first), "session", 1)
+        let metadata = try decoder.decode(SessionMetadata.self, from: Data(first))
+        let utterances = try lines.dropFirst().enumerated().map { offset, line in
+            try requireType(Data(line), "utterance", offset + 2)
+            return try decoder.decode(UtteranceRecord.self, from: Data(line))
+        }
+        try validate(utterances)
+        return (metadata, utterances)
+    }
+
+    /// Reuse a canonical transcript without running recognition again. App updates
+    /// and time-zone changes do not invalidate an otherwise identical recording.
+    public func read(from url: URL, matching expected: SessionMetadata) throws -> (metadata: SessionMetadata, utterances: [UtteranceRecord]) {
+        let result = try read(from: url)
+        let actual = result.metadata
+        let formatter = ISO8601DateFormatter()
+        guard actual.schemaVersion == expected.schemaVersion,
+              actual.sessionID == expected.sessionID, actual.title == expected.title,
+              actual.captureMode == expected.captureMode, actual.languageMode == expected.languageMode,
+              actual.durationMilliseconds == expected.durationMilliseconds,
+              let actualStart = formatter.date(from: actual.startedAt),
+              let expectedStart = formatter.date(from: expected.startedAt), actualStart == expectedStart,
+              let actualEnd = formatter.date(from: actual.endedAt),
+              let expectedEnd = formatter.date(from: expected.endedAt), actualEnd == expectedEnd,
+              !result.utterances.isEmpty else { throw TranscriptValidationError.sessionMismatch }
+        return result
+    }
+
     private func validate(_ utterances: [UtteranceRecord]) throws {
         var priorStart: Int64 = -1
         for (offset, utterance) in utterances.enumerated() {
@@ -138,9 +179,12 @@ public struct TranscriptJSONLWriter {
         if value == "self" || value == "unknown" {
             return true
         }
+        let value = value.hasPrefix("mic_") ? String(value.dropFirst(4)) : value
         guard value.hasPrefix("speaker_"), value.count == 10 else {
             return false
         }
-        return value.suffix(2).allSatisfy(\.isNumber)
+        let suffix = value.suffix(2)
+        return suffix.utf8.allSatisfy { (48...57).contains($0) }
+            && Int(suffix).map { (1...99).contains($0) } == true
     }
 }

@@ -1,0 +1,28 @@
+name: Verify macOS app
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      RECALL_CAPTURE_SIGN_IDENTITY: '-'
+      RECALL_CAPTURE_ALLOW_AD_HOC: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: brew install cmake ninja
+      - name: Prepare pinned runtime and model
+        run: ./Scripts/setup-nemotron-diarization.sh
+      - name: Build and verify
+        run: ./Scripts/verify.sh
+      - name: Render UI with synthetic state
+        run: ./Scripts/verify-ui.sh

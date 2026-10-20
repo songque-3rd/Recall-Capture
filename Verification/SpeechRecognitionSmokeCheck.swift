@@ -1,3 +1,4 @@
+import CaptureCore
 import Foundation
 
 @main
@@ -19,15 +20,13 @@ struct SpeechRecognitionSmokeCheck {
         )
 
         let characterCount = segments.reduce(0) { $0 + $1.text.count }
-        let averageConfidence = segments.isEmpty
-            ? 0
-            : segments.reduce(0) { $0 + $1.confidence } / Double(segments.count)
+        let averageConfidence = TranscriptText.confidence(segments.map(\.confidence))
         let recognizedDuration = segments.reduce(0.0) { $0 + $1.durationSeconds }
 
         print("speech-recognition-smoke: passed")
         print("segments=\(segments.count)")
         print("characters=\(characterCount)")
-        print(String(format: "averageConfidence=%.3f", averageConfidence))
+        print(averageConfidence.map { String(format: "averageConfidence=%.3f", $0) } ?? "averageConfidence=unavailable")
         print(String(format: "recognizedDuration=%.3f", recognizedDuration))
     }
 }

@@ -10,7 +10,7 @@ public enum LanguageMode: String, Codable, CaseIterable, Sendable {
     case japaneseAndEnglish = "ja-en"
 }
 
-public enum AudioTrack: String, Codable, CaseIterable, Sendable {
+public enum AudioTrack: String, Codable, CaseIterable, Sendable, Hashable {
     case microphone
     case system
     case mixed

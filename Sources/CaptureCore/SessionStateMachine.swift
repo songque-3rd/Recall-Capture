@@ -8,8 +8,6 @@ public enum SessionState: String, Equatable, Sendable {
     case transcribing
     case diarizing
     case formatting
-    case summarizingChunks
-    case summarizingOverall
     case writingArtifacts
     case validatingArtifacts
     case completed
@@ -39,9 +37,7 @@ public struct SessionStateMachine: Sendable {
         .detectingSpeech: [.transcribing, .failed],
         .transcribing: [.diarizing, .failed],
         .diarizing: [.formatting, .failed],
-        .formatting: [.summarizingChunks, .failed],
-        .summarizingChunks: [.summarizingOverall, .failed],
-        .summarizingOverall: [.writingArtifacts, .failed],
+        .formatting: [.writingArtifacts, .failed],
         .writingArtifacts: [.validatingArtifacts, .failed],
         .validatingArtifacts: [.completed, .failed],
         .completed: [],
